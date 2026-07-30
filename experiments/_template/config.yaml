@@ -1,0 +1,67 @@
+experiment: EXP001_slug
+seed: 0
+
+benchmark:
+  name: cec13
+  functions: [11]              # list of function ids, or "all"
+  dim: 30
+  budget: 300000               # total FEs per episode
+
+episode:
+  pop_size: 50
+  warmup_frac: 0.05
+  warmup:
+    strategy: rand/1/bin
+    F: 0.5
+    CR: 0.9
+  box_center: centroid         # centroid | incumbent
+  box_scales: [2.0, 1.5, 1.0, 0.667, 0.5]
+  box_min_frac: 0.0417         # 1/24
+  elitism: false
+  truncate_last_segment: true
+
+environment:
+  observation: traj20
+  n_checkpoints: 20
+  action_space: profiles_budget_area
+  budget_fracs: [0.05, 0.10, 0.15]
+  strategy_profiles:
+    - {strategy: rand/1/bin,            F: 0.5, CR: 0.9}
+    - {strategy: best/1/bin,            F: 0.5, CR: 0.9}
+    - {strategy: current-to-best/1/bin, F: 0.5, CR: 0.9}
+    - {strategy: rand/2/bin,            F: 0.5, CR: 0.9}
+  reward:
+    name: stagnation
+    lambda: 0.1
+    tau_stag: 3
+
+agent:
+  name: dqn
+  discounting: per_budget      # per_budget | per_step
+  gamma: 0.99
+  lr: 1.0e-3
+  hidden: [100, 75, 50]
+  buffer_size: 100000
+  batch_size: 64
+  target_update: 500
+  warmup_transitions: 100
+  epsilon: {start: 1.0, end: 0.05, decay_steps: 50000}
+
+training:
+  episodes: 1200
+  eval_every: 500              # training steps between evaluation checkpoints
+  eval_episodes: 10            # rollouts averaged per checkpoint
+  checkpoint_every: 500
+
+evaluation:
+  runs_per_function: 51
+  seed_offset: 900000          # eval seeds must not overlap training seeds
+  save_trajectory_seeds: 3     # persist full within-segment trajectories for N seeds/function
+  compare_against: []          # names of folders under baselines/
+
+slurm:                         # cluster resources; read by run_experiment.sh
+  time: "24:00:00"
+  mem: "16G"
+  cpus: 4
+  gpus: 1
+  account: <account>

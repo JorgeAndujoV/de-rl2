@@ -1,0 +1,19 @@
+[project]
+name = "derl2"
+version = "0.1.0"
+description = "Differential Evolution controlled by Reinforcement Learning (TensorFlow)"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "tensorflow>=2.15",
+    "matplotlib",
+    "pandas",
+    "pyyaml",
+    "scipy",
+]
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

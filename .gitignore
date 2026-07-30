@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+slurm_logs/
+runs/
+
+# Job outputs: keep the small records, exclude the bulky ones
+experiments/*/*/job_*/checkpoints/
+scripts/MACHINERY.md
