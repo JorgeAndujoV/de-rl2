@@ -74,4 +74,4 @@ slurm:                         # cluster resources; read by run_experiment.sh
   mem: "16G"
   cpus: 4
   gpus: 0                      # CPU-only: the DE core syncs per generation, so a GPU is slower here
-  account: def-<pi>            # <-- EDIT: your Nibi allocation, e.g. def-smith
+  account: def-bolufe           # <-- EDIT: your Nibi allocation, e.g. def-smith

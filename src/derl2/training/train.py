@@ -32,6 +32,7 @@ import time
 import numpy as np
 import tensorflow as tf
 
+from derl2 import run_metadata
 from derl2.agents import build_agent
 from derl2.config import Config, experiments_dir
 from derl2.environments import DEEnv
@@ -66,12 +67,13 @@ def git_commit():
 
 
 def resolve_out_dir(cfg, args):
-    """experiments/<exp_id>/<kind>/job_<slurm_id or 'local'>/"""
+    """experiments/<exp_id>/<kind>/  (one job per experiment mode: a fixed path,
+    no job_<id> layer — a failed run is deleted and re-run, a changed parameter
+    becomes a new EXP00N)."""
     if args.out_dir:
         return args.out_dir
     kind = "smoke" if cfg.is_smoke else args.kind
-    job_id = os.environ.get("SLURM_JOB_ID", "local")
-    return os.path.join(experiments_dir(), cfg.exp_id, kind, f"job_{job_id}")
+    return os.path.join(experiments_dir(), cfg.exp_id, kind)
 
 
 def eval_rollouts(env, agent, n_episodes):
@@ -112,21 +114,36 @@ def main():
     print(env.describe())
     print(f"commit {commit} | output {out_dir}")
 
-    # The authoritative record of what this job ran.
-    cfg.save(os.path.join(out_dir, "config_used.yaml"))
-    with open(os.path.join(out_dir, "git_commit.txt"), "w") as fh:
-        fh.write(commit + "\n")
+    # The authoritative record of what this job ran lives in run_metadata.json.
+    # run_experiment.sh writes it before training starts; when train.py is run by
+    # hand (outside run_experiment.sh) this fallback writes one if absent, so
+    # evaluate.py can always recover the resolved config from it.
+    run_metadata.ensure_start(out_dir, cfg, args.kind, commit=commit)
 
     # --- checkpointing ---
+    # checkpoints/ holds periodic snapshots for walltime/crash resume. At the end
+    # of a SUCCESSFUL run they are pruned to just checkpoints/final/ (end state)
+    # and checkpoints/best/ (lowest mean_eval_fitness); that pruning lives in
+    # run_experiment.sh's persist trap, which knows the exit status — a timeout
+    # or failure must keep the intermediates so the job can resume. best_eval is
+    # tracked inside the checkpoint so "best so far" survives a resume.
+    ckpts_dir = os.path.join(out_dir, "checkpoints")
     episode_var = tf.Variable(0, dtype=tf.int64, trainable=False)
-    ckpt = tf.train.Checkpoint(episode=episode_var, **agent.checkpoint_items())
-    manager = tf.train.CheckpointManager(
-        ckpt, os.path.join(out_dir, "checkpoints"), max_to_keep=3
-    )
+    best_eval_var = tf.Variable(np.inf, dtype=tf.float64, trainable=False)
+    ckpt = tf.train.Checkpoint(episode=episode_var, best_eval=best_eval_var,
+                               **agent.checkpoint_items())
+    manager = tf.train.CheckpointManager(ckpt, ckpts_dir, max_to_keep=3)
+    best_manager = tf.train.CheckpointManager(
+        tf.train.Checkpoint(**agent.checkpoint_items()),
+        os.path.join(ckpts_dir, "best"), max_to_keep=1)
+    final_manager = tf.train.CheckpointManager(
+        tf.train.Checkpoint(**agent.checkpoint_items()),
+        os.path.join(ckpts_dir, "final"), max_to_keep=1)
     if manager.latest_checkpoint:
         ckpt.restore(manager.latest_checkpoint)
         print(f"Resumed from {manager.latest_checkpoint} "
-              f"(episode {int(episode_var.numpy())})")
+              f"(episode {int(episode_var.numpy())}, "
+              f"best_eval {float(best_eval_var.numpy()):.4e})")
 
     log_path = os.path.join(out_dir, "training_log.csv")
     write_header = not os.path.exists(log_path)
@@ -158,6 +175,12 @@ def main():
     def log_checkpoint():
         ts = int(agent.train_steps.numpy())
         fits = eval_rollouts(eval_env, agent, eval_episodes)
+        # Retain the checkpoint with the lowest mean_eval_fitness seen so far
+        # (error, so lower is better) as checkpoints/best/.
+        mean_eval_fitness = float(fits.mean())
+        if mean_eval_fitness < float(best_eval_var.numpy()):
+            best_eval_var.assign(mean_eval_fitness)
+            best_manager.save()
         logger.writerow([
             ts, f"{time.perf_counter() - t_start:.2f}",
             f"{np.mean(returns):.6f}" if returns else "nan",
@@ -210,13 +233,17 @@ def main():
             log_file.close()
             print(f"Walltime limit reached at episode {episode + 1}; "
                   f"checkpointed. Re-run the same command to resume.")
-            sys.exit(0)
+            # Exit 42 signals a clean walltime stop (not completion) to
+            # run_experiment.sh, which labels the run "timeout", keeps the
+            # intermediate checkpoints, and does not run evaluation.
+            sys.exit(42)
 
     # A final checkpoint row so the end state is always recorded, even if the
     # last eval threshold fell between here and the previous checkpoint.
     if returns or losses:
         log_checkpoint()
     manager.save()
+    final_manager.save()          # the retained end-state (checkpoints/final/)
     log_file.close()
     print(f"Training finished. Output in {out_dir}")
 

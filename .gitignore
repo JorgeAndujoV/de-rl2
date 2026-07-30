@@ -1,10 +1,17 @@
 .venv/
+.claude/
 __pycache__/
 *.pyc
 *.egg-info/
-slurm_logs/
 runs/
 
-# Job outputs: keep the small records, exclude the bulky ones
-experiments/*/*/job_*/checkpoints/
+# Result artifacts: the small records — summary.csv, training_log.csv,
+# episode_results.csv, eval_results.csv, comparison.csv, run_metadata.json — ARE
+# committed (they are the record of an experiment). The bulky/regenerable ones
+# are not.
+slurm_logs/
+experiments/**/checkpoints/
+experiments/**/trajectories/
+*.bak.*
+
 scripts/MACHINERY.md

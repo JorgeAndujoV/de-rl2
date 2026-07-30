@@ -1,0 +1,89 @@
+experiment: EXP002_dqn_restart
+seed: 0
+
+# Follow-up to EXP001. Same question — can a DQN choosing {strategy, budget_frac,
+# sampling_box} per restart beat fixed restart policies on CEC'13 f11 (Rastrigin,
+# D=30) within 300k FEs? — with two changes:
+#   1. Each strategy profile now carries its own tuned F/CR (see below), instead
+#      of the uniform F=0.5/CR=0.9 EXP001 used. F and CR are still NOT in the
+#      action space: they are fixed constants attached to each strategy. A later
+#      experiment may let the agent choose them.
+#   2. Baselines are wired in (evaluation.compare_against), so summary.csv,
+#      eval_results.csv and comparison.csv are populated against BASE001/002/003.
+# EXP001 stays frozen as the record of the uniform-F/CR run.
+
+benchmark:
+  name: cec13
+  functions: [11]              # Rastrigin
+  dim: 30
+  budget: 300000               # total FEs per episode
+
+episode:
+  pop_size: 50
+  warmup_frac: 0.05
+  warmup:
+    strategy: rand/1/bin
+    F: 0.5
+    CR: 0.9
+  box_center: centroid         # centroid | incumbent
+  box_scales: [2.0, 1.5, 1.0, 0.667, 0.5]
+  box_min_frac: 0.0417         # 1/24
+  elitism: false
+  truncate_last_segment: true
+
+environment:
+  observation: traj20
+  n_checkpoints: 20
+  action_space: profiles_budget_area
+  budget_fracs: [0.05, 0.10, 0.15]
+  # Per-strategy F/CR: each strategy carries its own fixed parameters (this
+  # experiment only — not a global default). F/CR remain outside the action
+  # space; the agent chooses the strategy, and the strategy fixes F/CR.
+  strategy_profiles:
+    - {strategy: rand/1/bin,            F: 0.5, CR: 0.9}
+    - {strategy: best/1/bin,            F: 0.8, CR: 0.5}
+    - {strategy: current-to-best/1/bin, F: 0.5, CR: 0.3}
+    - {strategy: rand/2/bin,            F: 0.5, CR: 0.3}
+  reward:
+    name: stagnation
+    lambda: 0.1
+    tau_stag: 3
+
+agent:
+  name: dqn
+  discounting: per_budget      # per_budget | per_step
+  gamma: 0.99
+  lr: 1.0e-3
+  hidden: [100, 75, 50]
+  buffer_size: 100000
+  batch_size: 64
+  target_update: 500
+  warmup_transitions: 100
+  # decay_steps matched to this run's length: 1200 episodes is ~14k training
+  # steps, so decaying over 8k reaches epsilon=0.05 near episode ~670, leaving a
+  # clear exploitation phase.
+  epsilon: {start: 1.0, end: 0.05, decay_steps: 8000}
+
+training:
+  episodes: 1200
+  eval_every: 500              # training steps between evaluation checkpoints
+  eval_episodes: 10            # rollouts averaged per checkpoint
+  checkpoint_every: 500
+
+evaluation:
+  runs_per_function: 51
+  seed_offset: 900000          # eval seeds must not overlap training seeds
+  save_trajectory_seeds: 3     # persist full within-segment trajectories for N seeds/function
+  # Frozen baselines produced by scripts/run_baseline.py against THIS config.
+  # Generate them (once) before evaluating:
+  #   python -m scripts.run_baseline --baseline BASE001_de_plain       --config experiments/EXP002_dqn_restart/config.yaml
+  #   python -m scripts.run_baseline --baseline BASE002_fixed_schedule --config experiments/EXP002_dqn_restart/config.yaml
+  #   python -m scripts.run_baseline --baseline BASE003_random         --config experiments/EXP002_dqn_restart/config.yaml
+  compare_against: [BASE001_de_plain, BASE002_fixed_schedule, BASE003_random]
+
+slurm:                         # cluster resources; read by run_experiment.sh
+  time: "12:00:00"
+  mem: "16G"
+  cpus: 4
+  gpus: 0                      # CPU-only: the DE core syncs per generation, so a GPU is slower here
+  account: def-bolufe          # <-- EDIT: your Nibi allocation, e.g. def-smith

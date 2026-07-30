@@ -9,17 +9,17 @@ In short:
     parameter value means a NEW experiment, never an edit to an old one.
   * There are NO hidden defaults. What the file declares is the whole story;
     every knob a run depended on — including SLURM resources — is written in
-    config.yaml and copied verbatim into config_used.yaml. A missing key is an
-    error, not a silently-filled fallback: one config.yaml plus the modules it
-    names must fully explain what ran.
+    config.yaml and recorded verbatim in each job's run_metadata.json (under
+    resolved_config). A missing key is an error, not a silently-filled fallback:
+    one config.yaml plus the modules it names must fully explain what ran.
 
 This module deliberately knows nothing about which agents, observations,
 rewards, action spaces, or strategies exist. It reads and writes nested keys
 and checks a few structural invariants; anything type-specific is validated by
 the component that owns it.
 
-The loader mechanics (dotted get/set, deep-merge overrides, --smoke scaling,
-frozen config_used.yaml) are carried over from de-rl unchanged; the schema it
+The loader mechanics (dotted get/set, deep-merge overrides, --smoke scaling, the
+frozen resolved config) are carried over from de-rl unchanged; the schema it
 validates is the de-rl2 schema of §7, and the fallback shim de-rl used is
 removed — de-rl2 has no hidden defaults.
 
@@ -29,7 +29,8 @@ Typical use:
 
     cfg = Config.from_args()
     obs_name = cfg.get("environment.observation")
-    cfg.save(os.path.join(out_dir, "config_used.yaml"))
+    # what a job actually ran is recorded in its run_metadata.json
+    # (resolved_config); see derl2.run_metadata.
 """
 
 import argparse
@@ -277,10 +278,11 @@ class Config:
 
     # -------------------------------------------------------------- output
     def save(self, path):
-        """Write the fully resolved config into a job's output folder.
+        """Write the fully resolved config to `path` as YAML.
 
-        This file — not the experiment's config.yaml — is the authoritative
-        record of what a given job ran.
+        A utility for inspecting a resolved config; the authoritative per-job
+        record is run_metadata.json (resolved_config), written by
+        derl2.run_metadata — not this file.
         """
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         payload = self.as_dict()
