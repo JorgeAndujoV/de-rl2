@@ -1,4 +1,4 @@
-"""CEC'13 real-parameter optimization suite, functions 1-20.
+"""CEC'13 real-parameter optimization suite, functions 1-28.
 
 Reference: Liang, Qu, Suganthan, Hernandez-Diaz, Technical Report 201212,
 Zhengzhou University / NTU, 2013.
@@ -6,7 +6,11 @@ Zhengzhou University / NTU, 2013.
 Minimization on [-100, 100]^D. Each f_i has a bias f_i(x*) given in Table I;
 the quantity to report is the error f(x) - f_i(x*).
 
-Composition functions f21-f28 are deliberately not implemented.
+Composition functions f21-f28 (§2 of the report) are distance-weighted blends of
+the base functions f1-f20. They reuse this module's base kernels and transforms —
+so a composition stays numerically consistent with the standalone functions — and
+take only their recipe (which components, the sigmas / scales / local biases) from
+the reference implementation the suite was validated against.
 
 The NumPy path is float64 and is the reference. The TensorFlow path is float32
 (matching VectorizedDE) and will lose precision on the ill-conditioned
@@ -26,6 +30,8 @@ _OPTIMA = {
     6: -900.0, 7: -800.0, 8: -700.0, 9: -600.0, 10: -500.0,
     11: -400.0, 12: -300.0, 13: -200.0, 14: -100.0, 15: 100.0,
     16: 200.0, 17: 300.0, 18: 400.0, 19: 500.0, 20: 600.0,
+    21: 700.0, 22: 800.0, 23: 900.0, 24: 1000.0, 25: 1100.0,
+    26: 1200.0, 27: 1300.0, 28: 1400.0,
 }
 
 _NAMES = {
@@ -38,6 +44,56 @@ _NAMES = {
     17: "Lunacek bi-Rastrigin", 18: "Rotated Lunacek bi-Rastrigin",
     19: "Rotated Expanded Griewank plus Rosenbrock",
     20: "Rotated Expanded Schaffer F6",
+    21: "Composition Function 1", 22: "Composition Function 2",
+    23: "Composition Function 3", 24: "Composition Function 4",
+    25: "Composition Function 5", 26: "Composition Function 6",
+    27: "Composition Function 7", 28: "Composition Function 8",
+}
+
+
+# --------------------------------------------------------------- compositions
+# Each composition f21-f28 (report §2, Table VI-VII) blends several base
+# functions. For component k: evaluate base function `components[k]` at its own
+# shift (block k) and rotation (matrices k, k+1), take its raw value (optimum at
+# 0), multiply by `scales[k]`, add local bias `biases[k]`; the components are
+# combined by cf_cal with per-component Gaussian bandwidth `sigmas[k]`. The whole
+# blend is offset by the composition's f(x*) = _OPTIMA[n].
+#
+# components / scales / sigmas / biases are the competition-defined recipe; the
+# component values themselves come from this module's base kernels.
+_COMPOSITIONS = {
+    21: {"components": [6, 5, 3, 4, 1],
+         "scales":     [1.0, 1.0e-6, 1.0e-26, 1.0e-6, 1.0e-1],
+         "sigmas":     [10, 20, 30, 40, 50],
+         "biases":     [0, 100, 200, 300, 400]},
+    22: {"components": [14, 14, 14],
+         "scales":     [1.0, 1.0, 1.0],
+         "sigmas":     [20, 20, 20],
+         "biases":     [0, 100, 200]},
+    23: {"components": [15, 15, 15],
+         "scales":     [1.0, 1.0, 1.0],
+         "sigmas":     [20, 20, 20],
+         "biases":     [0, 100, 200]},
+    24: {"components": [15, 12, 9],
+         "scales":     [0.25, 1.0, 2.5],
+         "sigmas":     [20, 20, 20],
+         "biases":     [0, 100, 200]},
+    25: {"components": [15, 12, 9],
+         "scales":     [0.25, 1.0, 2.5],
+         "sigmas":     [10, 30, 50],
+         "biases":     [0, 100, 200]},
+    26: {"components": [15, 12, 2, 9, 10],
+         "scales":     [0.25, 1.0, 1.0e-7, 2.5, 10.0],
+         "sigmas":     [10, 10, 10, 10, 10],
+         "biases":     [0, 100, 200, 300, 400]},
+    27: {"components": [10, 12, 15, 9, 1],
+         "scales":     [100.0, 10.0, 2.5, 25.0, 0.1],
+         "sigmas":     [10, 10, 10, 20, 20],
+         "biases":     [0, 100, 200, 300, 400]},
+    28: {"components": [19, 7, 15, 20, 1],
+         "scales":     [2.5, 2.5e-3, 2.5, 5.0e-4, 0.1],
+         "sigmas":     [10, 20, 30, 40, 50],
+         "biases":     [0, 100, 200, 300, 400]},
 }
 
 
@@ -319,13 +375,19 @@ _BASE_TF = {
 
 # ------------------------------------------------------------ z construction
 
-def _z_builders(func_no, dim):
+def _z_builders(func_no, dim, shift_block=0, rot_base=0, force_rotate=False):
     """Return (z_np, z_tf): x -> the transformed z the base function consumes.
 
     Encodes the per-function shift / rotate / scale chain from section 1.3.
     Rotation is applied as z @ M.T, i.e. M x for a column vector x.
+
+    shift_block / rot_base let a composition reuse a base function at a shifted
+    data block: the shift is read from block `shift_block`, and rotation index i
+    maps to matrix `rot_base + i`. Both default to 0, so a standalone f1-f20 is
+    unchanged. force_rotate rotates the otherwise shift-only functions (f1, f5),
+    which the compositions apply to their components.
     """
-    o = shift_for(func_no, dim)
+    o = shift_for(func_no, dim, block=shift_block)
     o_tf = tf.constant(o, tf.float32)
     lam10 = _lambda_diag(dim, 10.0)
     lam100 = _lambda_diag(dim, 100.0)
@@ -333,12 +395,16 @@ def _z_builders(func_no, dim):
     lam100_tf = tf.constant(lam100, tf.float32)
 
     def rot(i):
-        M = rotation_for(dim, i)
+        M = rotation_for(dim, rot_base + i)
         return M, tf.constant(M, tf.float32)
 
     n = func_no
 
-    if n in (1, 5):                                     # shift only
+    if n in (1, 5):                                     # shift only (rotated in a
+        if force_rotate:                                # composition component)
+            M1, M1t = rot(0)
+            return (lambda x: (x - o) @ M1.T,
+                    lambda x: tf.matmul(x - o_tf, M1t, transpose_b=True))
         return (lambda x: x - o,
                 lambda x: x - o_tf)
 
@@ -510,15 +576,90 @@ def _lunacek_tf(y, dim, rotate):
 
 # -------------------------------------------------------------------- assembly
 
+def _build_composition(n, dim):
+    """Assemble a composition function f21-f28 (report §2).
+
+    Reuses this module's base kernels for the component values, so a composition
+    is numerically consistent with the standalone f1-f20; only the recipe
+    (components / scales / sigmas / local biases) comes from _COMPOSITIONS.
+    """
+    spec = _COMPOSITIONS[n]
+    components = spec["components"]
+    scales = spec["scales"]
+    sigmas = np.array(spec["sigmas"], dtype=np.float64)
+    sub_biases = np.array(spec["biases"], dtype=np.float64)
+    comp_bias = float(_OPTIMA[n])
+    C = len(components)
+
+    # One shift block per component; fail clearly if shift_data.txt is too short
+    # rather than silently broadcasting a truncated sub-optimum.
+    if shift_for(components[-1], dim, block=C - 1).shape[0] != dim:
+        raise ValueError(
+            f"shift_data.txt has too few values for composition f{n}: it needs "
+            f"{C} shift blocks of dim {dim}. Check data/cec13/input_data."
+        )
+
+    builders, o_list = [], []
+    for k, base in enumerate(components):
+        z_np, z_tf = _z_builders(base, dim, shift_block=k, rot_base=k,
+                                 force_rotate=base in (1, 5))
+        builders.append((base, z_np, z_tf))
+        o_list.append(shift_for(base, dim, block=k))
+    O = np.stack(o_list, axis=0)                       # (C, D)
+    O_tf = tf.constant(O, tf.float32)
+    sigmas_tf = tf.constant(sigmas, tf.float32)
+    sub_biases_tf = tf.constant(sub_biases, tf.float32)
+
+    def _cf_weights_np(x2):
+        # Gaussian of the distance to each sub-optimum; nearer components weigh
+        # more. All-underflowed rows fall back to uniform (report §2.2).
+        diff = x2[:, None, :] - O[None, :, :]          # (N, C, D)
+        d2 = np.sum(diff * diff, axis=-1)              # (N, C)
+        W = np.exp(-d2 / (2.0 * dim * sigmas[None, :] ** 2)) / np.sqrt(d2 + 1e-30)
+        W = np.where(W.max(axis=1, keepdims=True) == 0.0, 1.0, W)
+        return W / W.sum(axis=1, keepdims=True)
+
+    def eval_np(x):
+        x2 = np.atleast_2d(np.asarray(x, np.float64))
+        fits = np.empty((x2.shape[0], C), np.float64)
+        for k, (base, z_np, _z_tf) in enumerate(builders):
+            fits[:, k] = _BASE_NP[base](z_np(x2)) * scales[k]
+        omega = _cf_weights_np(x2)
+        val = np.sum(omega * (fits + sub_biases[None, :]), axis=1) + comp_bias
+        return float(val[0])
+
+    def eval_tf(x):
+        fits = tf.stack(
+            [_BASE_TF[base](z_tf(x)) * float(scales[k])
+             for k, (base, _z_np, z_tf) in enumerate(builders)], axis=1)  # (N,C)
+        diff = x[:, None, :] - O_tf[None, :, :]        # (N, C, D)
+        d2 = tf.reduce_sum(diff * diff, axis=-1)       # (N, C)
+        W = tf.exp(-d2 / (2.0 * dim * sigmas_tf[None, :] ** 2)) / tf.sqrt(d2 + 1e-30)
+        cond = tf.broadcast_to(
+            tf.reduce_max(W, axis=1, keepdims=True) <= 0.0, tf.shape(W))
+        W = tf.where(cond, tf.ones_like(W), W)
+        omega = W / tf.reduce_sum(W, axis=1, keepdims=True)
+        return tf.reduce_sum(omega * (fits + sub_biases_tf[None, :]),
+                             axis=1) + comp_bias
+
+    return BenchmarkSpec(
+        id=f"cec13:f{n}", suite="cec13", name=_NAMES[n], dim=dim,
+        lower=LOWER, upper=UPPER, optimum=comp_bias,
+        evaluate_np=eval_np, evaluate_tf=eval_tf,
+    )
+
+
 def _build(name, dim):
     if not (name.startswith("f") and name[1:].isdigit()):
         raise KeyError(f"CEC'13 names look like 'f11', got {name!r}.")
     n = int(name[1:])
     if n not in _OPTIMA:
         raise KeyError(
-            f"CEC'13 f{n} is not available. Implemented: f1-f20 "
-            f"(composition functions f21-f28 are out of scope)."
+            f"CEC'13 f{n} is not available. Implemented: f1-f28."
         )
+
+    if n in _COMPOSITIONS:
+        return _build_composition(n, dim)
 
     z_np, z_tf = _z_builders(n, dim)
     bias = _OPTIMA[n]

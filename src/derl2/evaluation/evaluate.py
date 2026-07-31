@@ -152,30 +152,32 @@ def write_summary(path, episode_rows):
 BASELINE_PARITY_KEYS = ("functions", "dim", "budget", "seeds")
 
 
-def baseline_dir(name):
-    return os.path.join(repo_root(), "baselines", name)
+def baseline_dir(name, function_id):
+    """baselines/f<fid>/<name>/ — baselines are stored per function, so each of
+    a multi-function experiment's per-function jobs finds its own reference."""
+    return os.path.join(repo_root(), "baselines", f"f{function_id}", name)
 
 
-def _missing_baseline_error(name, path):
+def _missing_baseline_error(name, path, function_id):
     return FileNotFoundError(
-        f"Baseline {name!r} not found at {path}. Baselines are produced "
-        f"deliberately and never auto-generated. Create it with:\n"
+        f"Baseline {name!r} for f{function_id} not found at {path}. Baselines "
+        f"are produced deliberately and never auto-generated. Create it with:\n"
         f"    python -m scripts.run_baseline --baseline {name} "
-        f"--config <this experiment's config.yaml>\n"
+        f"--config <this experiment's config.yaml> --function {function_id}\n"
         f"(append --smoke for a smoke-scale baseline)."
     )
 
 
-def load_baseline(name):
-    """Read baselines/<name>/{results.csv, baseline_config.yaml}.
+def load_baseline(name, function_id):
+    """Read baselines/f<fid>/<name>/{results.csv, baseline_config.yaml}.
 
     Returns (by_seed, baseline_cfg) where by_seed maps (function_id, seed) ->
     (best_error, evals_used)."""
-    d = baseline_dir(name)
+    d = baseline_dir(name, function_id)
     results = os.path.join(d, "results.csv")
     cfg_path = os.path.join(d, "baseline_config.yaml")
     if not os.path.exists(results):
-        raise _missing_baseline_error(name, d)
+        raise _missing_baseline_error(name, d, function_id)
     by_seed = {}
     with open(results, newline="") as fh:
         for row in csv.DictReader(fh):
@@ -187,6 +189,19 @@ def load_baseline(name):
         with open(cfg_path) as fh:
             baseline_cfg = yaml.safe_load(fh) or {}
     return by_seed, baseline_cfg
+
+
+def check_baselines_available(cfg, functions):
+    """Fail fast (before a long training run) if any baseline this experiment
+    compares against is missing for a function it will evaluate. A periodic
+    evaluation mid-training must never be the thing that discovers a missing
+    baseline and kills a multi-day job."""
+    compare_against = cfg.get("evaluation.compare_against")
+    for fid in functions:
+        for name in compare_against:
+            d = baseline_dir(name, fid)
+            if not os.path.exists(os.path.join(d, "results.csv")):
+                raise _missing_baseline_error(name, d, fid)
 
 
 def check_parity(name, baseline_cfg, expected):
@@ -289,34 +304,21 @@ def write_comparison(path, keys, agent_by_seed, baselines, compare_against):
                             f"{pct:.4f}", f"{stat:.6g}", f"{p:.6g}"])
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--train-dir", required=True,
-                        help="Training job dir (has run_metadata.json, "
-                             "checkpoints/)")
-    parser.add_argument("--out-dir", default=None,
-                        help="Where to write the result files. Defaults to the "
-                             "training job dir itself, so a run_experiment.sh "
-                             "job keeps all of §8's outputs in one folder that "
-                             "its persist step copies back.")
-    args = parser.parse_args()
+def evaluate_policy(cfg, env, policy, out_dir):
+    """Run the greedy `policy` on the evaluation seeds and write §8's files into
+    `out_dir` (episode_results, step_trace, summary, eval_results, comparison,
+    trajectories). Used by both the CLI (policy restored from a checkpoint) and
+    train.py's in-process periodic evaluation (policy = the live agent), so a
+    mid-training checkpoint produces the identical set of files a final run does.
 
-    # Evaluation uses the config the training job ACTUALLY ran (smoke-scaled if
-    # it was a smoke job), recovered from run_metadata.json — never the possibly
-    # unscaled on-disk config.yaml.
-    cfg = run_metadata.load_resolved_config(args.train_dir)
-    env = DEEnv.from_config(cfg)
-    print(cfg.summary())
-    print(env.describe())
-
-    policy = build_agent_policy(args.train_dir, cfg, env)
-
+    Baselines are read per function from baselines/f<fid>/<name>/, checked for
+    function/dim/budget/seed parity, and refused on mismatch."""
     runs = cfg.get("evaluation.runs_per_function")
     offset = cfg.get("evaluation.seed_offset")
     save_traj = cfg.get("evaluation.save_trajectory_seeds")
     compare_against = cfg.get("evaluation.compare_against")
 
-    out_dir = os.path.abspath(args.out_dir or args.train_dir)
+    out_dir = os.path.abspath(out_dir)
     os.makedirs(out_dir, exist_ok=True)
     traj_dir = os.path.join(out_dir, "trajectories")
 
@@ -368,13 +370,14 @@ def main():
     keys = sorted(agent_by_seed)
 
     seed_list = [offset + i for i in range(runs)]
-    expected = {"functions": sorted(env.functions), "dim": env.dim,
-                "budget": env.budget, "seeds": sorted(seed_list)}
-    baselines = {}
-    for name in compare_against:
-        by_seed, baseline_cfg = load_baseline(name)
-        check_parity(name, baseline_cfg, expected)
-        baselines[name] = by_seed
+    baselines = {name: {} for name in compare_against}
+    for fid in env.functions:
+        expected = {"functions": [fid], "dim": env.dim,
+                    "budget": env.budget, "seeds": sorted(seed_list)}
+        for name in compare_against:
+            by_seed, baseline_cfg = load_baseline(name, fid)
+            check_parity(name, baseline_cfg, expected)
+            baselines[name].update(by_seed)
 
     write_eval_results(os.path.join(out_dir, "eval_results.csv"), keys,
                        agent_by_seed, baselines, compare_against)
@@ -389,6 +392,37 @@ def main():
     # No key_result.txt: this line duplicates summary.csv; print for the log.
     print(f"\n{key_result}")
     print(f"Results in {out_dir}")
+    return key_result
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train-dir", required=True,
+                        help="Training job dir (has run_metadata.json, "
+                             "checkpoints/)")
+    parser.add_argument("--out-dir", default=None,
+                        help="Where to write the result files. Defaults to the "
+                             "training job dir itself, so a run_experiment.sh "
+                             "job keeps all of §8's outputs in one folder that "
+                             "its persist step copies back.")
+    parser.add_argument("--function", type=int, default=None,
+                        help="Restrict evaluation to one function id (the "
+                             "per-function EXP003 layout); defaults to whatever "
+                             "the training job's config recorded.")
+    args = parser.parse_args()
+
+    # Evaluation uses the config the training job ACTUALLY ran (smoke-scaled if
+    # it was a smoke job), recovered from run_metadata.json — never the possibly
+    # unscaled on-disk config.yaml.
+    cfg = run_metadata.load_resolved_config(args.train_dir)
+    if args.function is not None:
+        cfg.set("benchmark.functions", [args.function])
+    env = DEEnv.from_config(cfg)
+    print(cfg.summary())
+    print(env.describe())
+
+    policy = build_agent_policy(args.train_dir, cfg, env)
+    evaluate_policy(cfg, env, policy, args.out_dir or args.train_dir)
 
 
 if __name__ == "__main__":

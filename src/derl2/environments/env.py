@@ -35,9 +35,9 @@ from derl2.environments.observations import build_observation
 from derl2.environments.rewards import build_reward
 from derl2.environments.sampling_box import transform_box
 
-# "all" resolves to the implemented CEC'13 set (f1–f20; the composition
-# functions f21–f28 are out of scope, see benchmarks/cec13.py).
-_ALL_FUNCTIONS = list(range(1, 21))
+# "all" resolves to the full implemented CEC'13 set (f1–f28, including the
+# composition functions f21–f28; see benchmarks/cec13.py).
+_ALL_FUNCTIONS = list(range(1, 29))
 
 
 class DEEnv:

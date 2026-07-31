@@ -20,7 +20,9 @@ dimension, and total FE budget as the agent, all read from the experiment config
 what makes the later paired comparison in evaluate.py legitimate; evaluate.py
 re-checks it from baseline_config.yaml and refuses to compare on a mismatch.
 
-Writes baselines/<name>/:
+Baselines are stored per function. --function N produces one function's baseline;
+omitting it produces every function in the config. Writes, for each function,
+baselines/f<N>/<name>/:
     results.csv           seed, function_id, best_error, evals_used
     baseline_config.yaml  the exact settings used (function/dim/budget/seeds +
                           the baseline's own constants)
@@ -204,41 +206,51 @@ def main():
     parser.add_argument("--cr", dest="CR", type=float, default=0.9)
     parser.add_argument("--budget-frac", type=float, default=0.10)
     parser.add_argument("--sampling-box", type=int, default=2)
+    parser.add_argument("--function", type=int, default=None,
+                        help="Produce the baseline for a single function id, "
+                             "into baselines/f<id>/<name>/. Omit to produce it "
+                             "for every function in the config.")
     args = parser.parse_args()
 
     cfg = Config.from_file(args.config, smoke=args.smoke)
     env = DEEnv.from_config(cfg)               # resolves "all"/list functions
-    functions = list(env.functions)
     seeds = seed_list(cfg)
 
-    out_dir = os.path.join(repo_root(), "baselines", args.baseline)
-    os.makedirs(out_dir, exist_ok=True)
+    functions = ([args.function] if args.function is not None
+                 else list(env.functions))
 
-    print(f"Producing {args.baseline}: functions={functions} dim={env.dim} "
-          f"budget={env.budget} seeds={seeds[0]}..{seeds[-1]} "
-          f"({len(seeds)} each)" + (" [SMOKE]" if cfg.is_smoke else ""))
+    # One frozen baseline per function, each in its own baselines/f<N>/<name>/
+    # folder so a per-function experiment job finds exactly its reference.
+    for fid in functions:
+        out_dir = os.path.join(repo_root(), "baselines", f"f{fid}",
+                               args.baseline)
+        os.makedirs(out_dir, exist_ok=True)
 
-    run_metadata.write_start(out_dir, cfg, kind="baseline")
-    try:
-        if args.baseline == DE_PLAIN:
-            rows, extra = run_de_plain(cfg, functions, seeds,
-                                       args.strategy, args.F, args.CR)
-        elif args.baseline == FIXED_SCHEDULE:
-            rows, extra = run_fixed_schedule(cfg, functions, seeds,
-                                             args.strategy, args.budget_frac,
-                                             args.sampling_box)
-        else:  # RANDOM
-            rows, extra = run_random(cfg, functions, seeds)
+        print(f"Producing {args.baseline} for f{fid}: dim={env.dim} "
+              f"budget={env.budget} seeds={seeds[0]}..{seeds[-1]} "
+              f"({len(seeds)} each)" + (" [SMOKE]" if cfg.is_smoke else ""))
 
-        write_results(out_dir, rows)
-        write_baseline_config(out_dir, args.baseline, cfg, functions, seeds,
-                              extra)
-    except Exception:
-        run_metadata.write_finish(out_dir, "failed")
-        raise
-    run_metadata.write_finish(out_dir, "completed")
+        run_metadata.write_start(out_dir, cfg, kind="baseline")
+        try:
+            if args.baseline == DE_PLAIN:
+                rows, extra = run_de_plain(cfg, [fid], seeds,
+                                           args.strategy, args.F, args.CR)
+            elif args.baseline == FIXED_SCHEDULE:
+                rows, extra = run_fixed_schedule(cfg, [fid], seeds,
+                                                 args.strategy, args.budget_frac,
+                                                 args.sampling_box)
+            else:  # RANDOM
+                rows, extra = run_random(cfg, [fid], seeds)
 
-    print(f"Wrote {len(rows)} rows to {out_dir}/results.csv")
+            write_results(out_dir, rows)
+            write_baseline_config(out_dir, args.baseline, cfg, [fid], seeds,
+                                  extra)
+        except Exception:
+            run_metadata.write_finish(out_dir, "failed")
+            raise
+        run_metadata.write_finish(out_dir, "completed")
+
+        print(f"Wrote {len(rows)} rows to {out_dir}/results.csv")
 
 
 if __name__ == "__main__":

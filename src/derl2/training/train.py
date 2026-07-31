@@ -25,6 +25,7 @@ restarts.
 
 import csv
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -36,6 +37,8 @@ from derl2 import run_metadata
 from derl2.agents import build_agent
 from derl2.config import Config, experiments_dir
 from derl2.environments import DEEnv
+from derl2.evaluation.evaluate import (check_baselines_available,
+                                       evaluate_policy)
 from derl2.replay import ReplayBuffer
 
 # Seed offset for the greedy evaluation rollouts run during training. Kept well
@@ -139,11 +142,18 @@ def main():
     final_manager = tf.train.CheckpointManager(
         tf.train.Checkpoint(**agent.checkpoint_items()),
         os.path.join(ckpts_dir, "final"), max_to_keep=1)
+    # The replay buffer is plain NumPy, so it is saved/restored alongside the
+    # resume checkpoint (not inside it). Restoring it keeps a resumed run
+    # continuous instead of retraining on a fresh, tiny, correlated buffer.
+    buffer_path = os.path.join(ckpts_dir, "replay_buffer.npz")
     if manager.latest_checkpoint:
         ckpt.restore(manager.latest_checkpoint)
+        if os.path.exists(buffer_path):
+            buffer.load(buffer_path)
         print(f"Resumed from {manager.latest_checkpoint} "
               f"(episode {int(episode_var.numpy())}, "
-              f"best_eval {float(best_eval_var.numpy()):.4e})")
+              f"best_eval {float(best_eval_var.numpy()):.4e}, "
+              f"buffer {buffer.size})")
 
     log_path = os.path.join(out_dir, "training_log.csv")
     write_header = not os.path.exists(log_path)
@@ -160,6 +170,56 @@ def main():
     checkpoint_every = cfg.get("training.checkpoint_every")
     batch_size = agent.batch_size
     warmup = agent.warmup_transitions
+
+    # Episode-based periodic checkpoint+evaluation (EXP003): every
+    # `periodic_eval.every` episodes from `periodic_eval.start`, save a named
+    # checkpoint and run the FULL §8 evaluation on the current greedy policy,
+    # writing eval/chkp<k>/ — so a long run yields results as it goes rather
+    # than only at the end. Absent from a config (EXP001/EXP002) -> inactive.
+    periodic_every = cfg.get("training.periodic_eval.every", default=None)
+    periodic_start = cfg.get("training.periodic_eval.start",
+                             default=periodic_every)
+    eval_root = os.path.join(out_dir, "eval")
+    if periodic_every:
+        # Fail before training, not at the first checkpoint: a missing baseline
+        # must not surface hours into a multi-day job.
+        check_baselines_available(cfg, env.functions)
+
+    def periodic_checkpoint(k, n_ep):
+        """Save checkpoints/chkp<k>/, snapshot the learning curve, and run the
+        full evaluation on the live greedy policy into eval/chkp<k>/. Greedy and
+        on a separate env, so it does not perturb the training trajectory."""
+        tf.train.Checkpoint(**agent.checkpoint_items()).save(
+            os.path.join(ckpts_dir, f"chkp{k}", "ckpt"))
+        eval_dir = os.path.join(eval_root, f"chkp{k}")
+        os.makedirs(eval_dir, exist_ok=True)
+        log_file.flush()
+        if os.path.exists(log_path):
+            shutil.copyfile(log_path,
+                            os.path.join(eval_dir, "training_log.csv"))
+        try:
+            evaluate_policy(cfg, eval_env,
+                            lambda obs: agent.act(obs, epsilon=0.0), eval_dir)
+            # Copy this checkpoint's outputs to the persisted location NOW, so
+            # $HOME fills in progressively rather than only when the persist trap
+            # runs at job end — the whole point of evaluating during training.
+            # run_experiment.sh exports DERL2_FINAL_DIR; a hand-run leaves it
+            # unset and just keeps everything in out_dir.
+            final_dir = os.environ.get("DERL2_FINAL_DIR")
+            if final_dir:
+                for rel in (os.path.join("eval", f"chkp{k}"),
+                            os.path.join("checkpoints", f"chkp{k}")):
+                    src = os.path.join(out_dir, rel)
+                    if os.path.isdir(src):
+                        shutil.copytree(src, os.path.join(final_dir, rel),
+                                        dirs_exist_ok=True)
+                os.makedirs(final_dir, exist_ok=True)
+                shutil.copyfile(log_path,
+                                os.path.join(final_dir, "training_log.csv"))
+                print(f"  chkp{k}: results persisted to {final_dir}", flush=True)
+        except Exception as err:      # never lose training progress to an eval
+            print(f"WARNING: periodic evaluation at episode {n_ep} (chkp{k}) "
+                  f"failed: {err}", flush=True)
 
     start = int(episode_var.numpy())
     t_start = time.perf_counter()      # monotonic; time.time() can step back
@@ -215,6 +275,7 @@ def main():
                 ts = int(agent.train_steps.numpy())
                 if ts >= next_ckpt_at:
                     manager.save()
+                    buffer.save(buffer_path)      # keep the resume pair in sync
                     next_ckpt_at += checkpoint_every
                 if ts >= next_eval_at:
                     # Aggregates the episodes completed since the last
@@ -226,10 +287,17 @@ def main():
         returns.append(ep_return)
         lengths.append(steps)
 
+        # Episode-based periodic checkpoint + full evaluation (EXP003).
+        completed = episode + 1
+        if periodic_every and completed >= periodic_start \
+                and completed % periodic_every == 0:
+            periodic_checkpoint(completed // periodic_every, completed)
+
         # Cluster walltime safety: checkpoint and exit cleanly rather than
         # being killed mid-episode.
         if args.max_hours and (time.perf_counter() - t_start) / 3600.0 > args.max_hours:
             manager.save()
+            buffer.save(buffer_path)
             log_file.close()
             print(f"Walltime limit reached at episode {episode + 1}; "
                   f"checkpointed. Re-run the same command to resume.")
@@ -243,7 +311,8 @@ def main():
     if returns or losses:
         log_checkpoint()
     manager.save()
-    final_manager.save()          # the retained end-state (checkpoints/final/)
+    buffer.save(buffer_path)       # final buffer: retained for extending later
+    final_manager.save()           # the retained end-state (checkpoints/final/)
     log_file.close()
     print(f"Training finished. Output in {out_dir}")
 

@@ -1,0 +1,110 @@
+experiment: EXP003_dqn_restart
+seed: 0
+
+# Same agent, action space, observation, reward, DE core and per-strategy F/CR as
+# EXP002 — the ONE change is scale and cadence: 10,000 episodes with an
+# in-process checkpoint + full evaluation every 1,000 episodes (chkp1..chkp10),
+# so a multi-day run yields results as it goes rather than only at the end.
+#
+# One Slurm job PER FUNCTION (independent agents), run in parallel on Nibi and
+# written into experiments/EXP003_dqn_restart/f<N>/. This is the experiment that
+# ties the six functions together: identical config, different objective. A later
+# EXP004 that changes parameters re-runs the same six-function sweep.
+#
+# EXP002 is superseded (it had no replay-buffer persistence); EXP003 re-runs from
+# scratch. The replay buffer is now persisted (latest for walltime-resume, final
+# for extending a run later).
+
+benchmark:
+  name: cec13
+  # The six-function sweep. Each is trained by its own job (run_experiment.sh
+  # --function N, or the no-arg fan-out submits one job per function). f24 is a
+  # composition function — hold its job until the compositions are validated.
+  functions: [2, 8, 11, 12, 17, 24]
+  dim: 30
+  budget: 300000               # total FEs per episode
+
+episode:
+  pop_size: 50
+  warmup_frac: 0.05
+  warmup:
+    strategy: rand/1/bin
+    F: 0.5
+    CR: 0.9
+  box_center: centroid         # centroid | incumbent
+  box_scales: [2.0, 1.5, 1.0, 0.667, 0.5]
+  box_min_frac: 0.0417         # 1/24
+  elitism: false
+  truncate_last_segment: true
+
+environment:
+  observation: traj20
+  n_checkpoints: 20
+  action_space: profiles_budget_area
+  budget_fracs: [0.05, 0.10, 0.15]
+  # Per-strategy F/CR (same as EXP002): each strategy carries its own fixed
+  # parameters. F/CR remain outside the action space; the agent chooses the
+  # strategy, and the strategy fixes F/CR.
+  strategy_profiles:
+    - {strategy: rand/1/bin,            F: 0.5, CR: 0.9}
+    - {strategy: best/1/bin,            F: 0.8, CR: 0.5}
+    - {strategy: current-to-best/1/bin, F: 0.5, CR: 0.3}
+    - {strategy: rand/2/bin,            F: 0.5, CR: 0.3}
+  reward:
+    name: stagnation
+    lambda: 0.1
+    tau_stag: 3
+
+agent:
+  name: dqn
+  discounting: per_budget      # per_budget | per_step
+  gamma: 0.99
+  lr: 1.0e-3
+  hidden: [100, 75, 50]
+  buffer_size: 100000
+  batch_size: 64
+  target_update: 500
+  warmup_transitions: 100
+  # ~12.9 training steps/episode (measured on EXP002), so 10,000 episodes is
+  # ~130k steps. Decay epsilon over the first ~30% (~40k steps) to 0.05 — longer
+  # than the SB3 10% default (justified by the 60-action space and modest total
+  # step budget), leaving a ~70% exploitation tail so chkp4..chkp10 reflect an
+  # increasingly converged greedy policy. Epsilon spans the whole run and never
+  # resets at a checkpoint.
+  epsilon: {start: 1.0, end: 0.05, decay_steps: 40000}
+
+training:
+  episodes: 10000
+  # Step-based learning-curve cadence (training_log.csv) and resume/buffer
+  # checkpointing, aligned at 2000 steps: ~65 learning-curve points over the run
+  # and a resume granularity of ~150 episodes, keeping the periodic 10-rollout
+  # eval cost proportionate on a 130k-step run.
+  eval_every: 2000             # training steps between learning-curve points
+  eval_episodes: 10            # rollouts averaged per learning-curve point
+  checkpoint_every: 2000       # training steps between resume checkpoints
+  # Episode-based full evaluation: at episodes 1000, 2000, ..., 10000 save
+  # checkpoints/chkp<k>/ and write the full §8 files into eval/chkp<k>/.
+  periodic_eval:
+    start: 1000
+    every: 1000
+
+evaluation:
+  runs_per_function: 51
+  seed_offset: 900000          # eval seeds must not overlap training seeds
+  save_trajectory_seeds: 3     # persist full within-segment trajectories for N seeds/function
+  # Frozen per-function baselines produced by scripts/run_baseline.py against
+  # THIS config. Generate them (once) for each function BEFORE submitting jobs;
+  # they land in baselines/f<N>/<method>/ and are checked for function/dim/
+  # budget/seed parity. f11's are migrated in from EXP002 and reused. E.g.:
+  #   python -m scripts.run_baseline --baseline BASE001_de_plain       --config experiments/EXP003_dqn_restart/config.yaml --function 2
+  #   python -m scripts.run_baseline --baseline BASE002_fixed_schedule --config experiments/EXP003_dqn_restart/config.yaml --function 2
+  #   python -m scripts.run_baseline --baseline BASE003_random         --config experiments/EXP003_dqn_restart/config.yaml --function 2
+  # (omit --function to produce a method for every function in one command).
+  compare_against: [BASE001_de_plain, BASE002_fixed_schedule, BASE003_random]
+
+slurm:                         # cluster resources; read by run_experiment.sh
+  time: "5-00:00:00"           # 5 days per function/job
+  mem: "16G"
+  cpus: 4
+  gpus: 0                      # CPU-only: the DE core syncs per generation, so a GPU is slower here
+  account: def-bolufe          # <-- EDIT: your Nibi allocation, e.g. def-smith
