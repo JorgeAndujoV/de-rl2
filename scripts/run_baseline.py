@@ -46,9 +46,10 @@ import yaml
 
 from derl2 import run_metadata
 from derl2.benchmarks import build_benchmark
-from derl2.config import Config, repo_root
+from derl2.config import Config
 from derl2.environments import DEEnv
-from derl2.evaluation.evaluate import fixed_policy, random_policy, run_episode
+from derl2.evaluation.evaluate import (baseline_dir, fixed_policy,
+                                       random_policy, run_episode)
 from derl2.optimizers import run_segment
 
 DE_PLAIN = "BASE001_de_plain"
@@ -222,8 +223,9 @@ def main():
     # One frozen baseline per function, each in its own baselines/f<N>/<name>/
     # folder so a per-function experiment job finds exactly its reference.
     for fid in functions:
-        out_dir = os.path.join(repo_root(), "baselines", f"f{fid}",
-                               args.baseline)
+        # Same path helper evaluate.py reads from, so producer and consumer
+        # never disagree; smoke baselines go to baselines/smoke/f<N>/<name>/.
+        out_dir = baseline_dir(args.baseline, fid, cfg.is_smoke)
         os.makedirs(out_dir, exist_ok=True)
 
         print(f"Producing {args.baseline} for f{fid}: dim={env.dim} "

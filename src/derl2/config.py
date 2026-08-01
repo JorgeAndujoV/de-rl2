@@ -156,6 +156,14 @@ class Config:
         if smoke:
             data = _deep_merge(data, SMOKE_OVERRIDES)
             data["smoke"] = True
+            # If the experiment does periodic in-process evaluation, scale its
+            # cadence down too — otherwise a 3-episode smoke never reaches
+            # periodic_eval.start (e.g. 1000) and the eval path goes untested,
+            # defeating the point of a smoke. Only applied when the config
+            # already declares periodic_eval (EXP001/EXP002 are unaffected).
+            if isinstance(data.get("training"), dict) \
+                    and "periodic_eval" in data["training"]:
+                data["training"]["periodic_eval"] = {"start": 1, "every": 1}
 
         cfg = cls(data, source=path)
 

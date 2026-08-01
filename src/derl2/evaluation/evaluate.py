@@ -152,32 +152,39 @@ def write_summary(path, episode_rows):
 BASELINE_PARITY_KEYS = ("functions", "dim", "budget", "seeds")
 
 
-def baseline_dir(name, function_id):
-    """baselines/f<fid>/<name>/ — baselines are stored per function, so each of
-    a multi-function experiment's per-function jobs finds its own reference."""
-    return os.path.join(repo_root(), "baselines", f"f{function_id}", name)
+def baseline_dir(name, function_id, smoke=False):
+    """Per-function baseline folder. Smoke-scale baselines live in a separate
+    baselines/smoke/f<fid>/<name>/ tree so they can coexist with the full-scale
+    baselines/f<fid>/<name>/ — a smoke rehearsal must not clobber the real
+    reference, and vice versa."""
+    parts = [repo_root(), "baselines"]
+    if smoke:
+        parts.append("smoke")
+    parts += [f"f{function_id}", name]
+    return os.path.join(*parts)
 
 
-def _missing_baseline_error(name, path, function_id):
+def _missing_baseline_error(name, path, function_id, smoke=False):
+    smoke_flag = " --smoke" if smoke else ""
     return FileNotFoundError(
         f"Baseline {name!r} for f{function_id} not found at {path}. Baselines "
         f"are produced deliberately and never auto-generated. Create it with:\n"
         f"    python -m scripts.run_baseline --baseline {name} "
-        f"--config <this experiment's config.yaml> --function {function_id}\n"
-        f"(append --smoke for a smoke-scale baseline)."
+        f"--config <this experiment's config.yaml> --function {function_id}"
+        f"{smoke_flag}"
     )
 
 
-def load_baseline(name, function_id):
-    """Read baselines/f<fid>/<name>/{results.csv, baseline_config.yaml}.
+def load_baseline(name, function_id, smoke=False):
+    """Read baselines[/smoke]/f<fid>/<name>/{results.csv, baseline_config.yaml}.
 
     Returns (by_seed, baseline_cfg) where by_seed maps (function_id, seed) ->
     (best_error, evals_used)."""
-    d = baseline_dir(name, function_id)
+    d = baseline_dir(name, function_id, smoke)
     results = os.path.join(d, "results.csv")
     cfg_path = os.path.join(d, "baseline_config.yaml")
     if not os.path.exists(results):
-        raise _missing_baseline_error(name, d, function_id)
+        raise _missing_baseline_error(name, d, function_id, smoke)
     by_seed = {}
     with open(results, newline="") as fh:
         for row in csv.DictReader(fh):
@@ -195,13 +202,13 @@ def check_baselines_available(cfg, functions):
     """Fail fast (before a long training run) if any baseline this experiment
     compares against is missing for a function it will evaluate. A periodic
     evaluation mid-training must never be the thing that discovers a missing
-    baseline and kills a multi-day job."""
+    baseline and kills a multi-day job. A smoke run checks the smoke tree."""
     compare_against = cfg.get("evaluation.compare_against")
     for fid in functions:
         for name in compare_against:
-            d = baseline_dir(name, fid)
+            d = baseline_dir(name, fid, cfg.is_smoke)
             if not os.path.exists(os.path.join(d, "results.csv")):
-                raise _missing_baseline_error(name, d, fid)
+                raise _missing_baseline_error(name, d, fid, cfg.is_smoke)
 
 
 def check_parity(name, baseline_cfg, expected):
@@ -375,7 +382,7 @@ def evaluate_policy(cfg, env, policy, out_dir):
         expected = {"functions": [fid], "dim": env.dim,
                     "budget": env.budget, "seeds": sorted(seed_list)}
         for name in compare_against:
-            by_seed, baseline_cfg = load_baseline(name, fid)
+            by_seed, baseline_cfg = load_baseline(name, fid, cfg.is_smoke)
             check_parity(name, baseline_cfg, expected)
             baselines[name].update(by_seed)
 
