@@ -44,7 +44,8 @@ class DEEnv:
     def __init__(self, *, suite, functions, dim, budget, pop_size, warmup_frac,
                  warmup, box_center, box_scales, box_min_frac, elitism,
                  truncate_last_segment, observation, n_checkpoints,
-                 action_space, budget_fracs, strategy_profiles, reward):
+                 action_space, budget_fracs, strategy_profiles, reward,
+                 exp_id=None, is_smoke=False):
         if elitism:
             raise ValueError(
                 "elitism=true is not implemented: this environment never "
@@ -74,8 +75,14 @@ class DEEnv:
         self.observation = build_observation(observation)
         self.action = build_action_space(action_space, strategy_profiles,
                                          budget_fracs)
-        self.reward_fn = build_reward(reward["name"], lam=reward["lambda"],
-                                      tau_stag=reward["tau_stag"])
+        # exp_id/is_smoke are threaded through only for rewards that need to read
+        # a frozen per-function baseline (median_stagnation -> m_i); every other
+        # reward ignores them. lambda/tau_stag default so a reward config that
+        # omits them (the penalty-free variants) still builds.
+        self.reward_fn = build_reward(
+            reward["name"], lam=reward.get("lambda", 0.0),
+            tau_stag=reward.get("tau_stag", 3),
+            exp_id=exp_id, is_smoke=is_smoke)
 
         # Strategy-profile name -> one-hot index, for the observation's C3a.
         # Profiles in profiles_budget_area are distinct strategies, so the map
@@ -111,6 +118,8 @@ class DEEnv:
             budget_fracs=cfg.get("environment.budget_fracs"),
             strategy_profiles=cfg.get("environment.strategy_profiles"),
             reward=cfg.get("environment.reward"),
+            exp_id=cfg.exp_id,
+            is_smoke=cfg.is_smoke,
         )
 
     def describe(self):
@@ -262,6 +271,7 @@ class DEEnv:
             "error_best": error_best_before,
             "error_new": error_new,
             "n_stag": n_stag_before,
+            "function_id": self.function_id,     # median_stagnation keys m_i on it
         })
         tau = seg.fes_used / (self.tau_frac * self.budget)
 

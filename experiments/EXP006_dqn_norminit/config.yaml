@@ -1,0 +1,89 @@
+experiment: EXP006_dqn_norminit
+seed: 0
+
+# EXP005-EXP008 are a REWARD ABLATION: identical to EXP003 in every respect
+# (agent, observation, DE core, per-strategy F/CR, 60-action menu, box_scales,
+# budget_fracs, warmup, episodes, checkpoint cadence, one Slurm job per function)
+# EXCEPT the reward function. box_scales and budget_fracs are EXP003's, NOT
+# EXP004's, so the SMDP tau unit is min(budget_fracs) = 0.05, matching EXP003.
+# The one shared change vs EXP003 is f8 (Rotated Ackley, uninformative plateau)
+# -> f6 (Rotated Rosenbrock, non-separable narrow valley). The reward effect is
+# read primarily on the four functions shared with EXP003 (f2, f11, f12, f24).
+#
+# EXP006's reward: LINEAR improvement normalized by the episode's INITIAL error.
+# R_t = (e_{t-1} - e_t) / (e_0 + c), no penalty, no additive -e_0 term. The
+# per-episode return is (e_0 - e_final)/(e_0 + c) in [0,1] = the fraction of the
+# initial error removed, so it is scale-free per episode and bounded regardless
+# of the function's magnitude. It keeps LINEAR improvement, so it fixes
+# cross-function scale but NOT within-episode first-segment dominance (once
+# e << e_0 the increments vanish) — this is the cheap comparison arm against the
+# log rewards (EXP005/EXP007). See src/derl2/environments/rewards.py (NormInitial).
+
+benchmark:
+  name: cec13
+  functions: [2, 6, 11, 12, 17, 24]
+  dim: 30
+  budget: 300000
+
+episode:
+  pop_size: 50
+  warmup_frac: 0.05
+  warmup:
+    strategy: rand/1/bin
+    F: 0.5
+    CR: 0.9
+  box_center: centroid
+  box_scales: [2.0, 1.5, 1.0, 0.667, 0.5]
+  box_min_frac: 0.0417
+  elitism: false
+  truncate_last_segment: true
+
+environment:
+  observation: traj20
+  n_checkpoints: 20
+  action_space: profiles_budget_area
+  budget_fracs: [0.05, 0.10, 0.15]          # EXP003 values -> tau unit 0.05
+  strategy_profiles:
+    - {strategy: rand/1/bin,            F: 0.5, CR: 0.9}
+    - {strategy: best/1/bin,            F: 0.8, CR: 0.5}
+    - {strategy: current-to-best/1/bin, F: 0.5, CR: 0.3}
+    - {strategy: rand/2/bin,            F: 0.5, CR: 0.3}
+  reward:
+    name: norm_initial         # linear improvement / initial error; return in [0,1]
+    # No stagnation penalty and no lambda/tau_stag: this reward has no penalty
+    # term (defaults apply and are ignored).
+
+agent:
+  name: dqn
+  discounting: per_budget
+  gamma: 0.99
+  lr: 1.0e-3
+  hidden: [100, 75, 50]
+  buffer_size: 100000
+  batch_size: 64
+  target_update: 500
+  warmup_transitions: 100
+  epsilon: {start: 1.0, end: 0.05, decay_steps: 40000}
+
+training:
+  episodes: 10000
+  eval_every: 2000
+  eval_episodes: 10
+  checkpoint_every: 2000
+  periodic_eval:
+    start: 1000
+    every: 1000
+
+evaluation:
+  runs_per_function: 51
+  seed_offset: 900000
+  save_trajectory_seeds: 3
+  # Job-generated baselines into baselines/EXP006_dqn_norminit/f<N>/<method>/.
+  compare_against: [BASE001_de_plain, BASE002_fixed_schedule, BASE003_random]
+
+slurm:
+  time: "5-00:00:00"
+  mem: "16G"
+  cpus: 4
+  gpus: 0
+  account: def-bolufe          # <-- EDIT if your Nibi allocation differs
