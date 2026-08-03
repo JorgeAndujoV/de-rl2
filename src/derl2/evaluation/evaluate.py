@@ -152,12 +152,20 @@ def write_summary(path, episode_rows):
 BASELINE_PARITY_KEYS = ("functions", "dim", "budget", "seeds")
 
 
-def baseline_dir(name, function_id, smoke=False):
-    """Per-function baseline folder. Smoke-scale baselines live in a separate
-    baselines/smoke/f<fid>/<name>/ tree so they can coexist with the full-scale
-    baselines/f<fid>/<name>/ — a smoke rehearsal must not clobber the real
-    reference, and vice versa."""
-    parts = [repo_root(), "baselines"]
+def baseline_dir(name, function_id, exp_id, smoke=False):
+    """Per-experiment, per-function baseline folder:
+    baselines/<exp_id>[/smoke]/f<fid>/<name>/.
+
+    Baselines are namespaced by EXPERIMENT because a baseline is only valid for
+    the exact episode/environment config it was produced under — warmup fraction,
+    box scales, budget-fraction menu, dim, budget, seeds. Two experiments that
+    change any of those (e.g. EXP003 vs EXP004, which alters warmup/box/budget)
+    have genuinely different BASE002/BASE003, so they must not share or clobber
+    one folder. A consequence we rely on: an experiment whose baselines have not
+    been generated fails fast in check_baselines_available rather than silently
+    reusing another experiment's numbers. Smoke-scale baselines live under a
+    /smoke subtree so a rehearsal never overwrites the real reference."""
+    parts = [repo_root(), "baselines", exp_id]
     if smoke:
         parts.append("smoke")
     parts += [f"f{function_id}", name]
@@ -175,12 +183,13 @@ def _missing_baseline_error(name, path, function_id, smoke=False):
     )
 
 
-def load_baseline(name, function_id, smoke=False):
-    """Read baselines[/smoke]/f<fid>/<name>/{results.csv, baseline_config.yaml}.
+def load_baseline(name, function_id, exp_id, smoke=False):
+    """Read baselines/<exp_id>[/smoke]/f<fid>/<name>/{results.csv,
+    baseline_config.yaml}.
 
     Returns (by_seed, baseline_cfg) where by_seed maps (function_id, seed) ->
     (best_error, evals_used)."""
-    d = baseline_dir(name, function_id, smoke)
+    d = baseline_dir(name, function_id, exp_id, smoke)
     results = os.path.join(d, "results.csv")
     cfg_path = os.path.join(d, "baseline_config.yaml")
     if not os.path.exists(results):
@@ -206,7 +215,7 @@ def check_baselines_available(cfg, functions):
     compare_against = cfg.get("evaluation.compare_against")
     for fid in functions:
         for name in compare_against:
-            d = baseline_dir(name, fid, cfg.is_smoke)
+            d = baseline_dir(name, fid, cfg.exp_id, cfg.is_smoke)
             if not os.path.exists(os.path.join(d, "results.csv")):
                 raise _missing_baseline_error(name, d, fid, cfg.is_smoke)
 
@@ -382,7 +391,8 @@ def evaluate_policy(cfg, env, policy, out_dir):
         expected = {"functions": [fid], "dim": env.dim,
                     "budget": env.budget, "seeds": sorted(seed_list)}
         for name in compare_against:
-            by_seed, baseline_cfg = load_baseline(name, fid, cfg.is_smoke)
+            by_seed, baseline_cfg = load_baseline(name, fid, cfg.exp_id,
+                                                  cfg.is_smoke)
             check_parity(name, baseline_cfg, expected)
             baselines[name].update(by_seed)
 

@@ -20,9 +20,9 @@ dimension, and total FE budget as the agent, all read from the experiment config
 what makes the later paired comparison in evaluate.py legitimate; evaluate.py
 re-checks it from baseline_config.yaml and refuses to compare on a mismatch.
 
-Baselines are stored per function. --function N produces one function's baseline;
-omitting it produces every function in the config. Writes, for each function,
-baselines/f<N>/<name>/:
+Baselines are stored per experiment and per function. --function N produces one
+function's baseline; omitting it produces every function in the config. Writes,
+for each function, baselines/<experiment>/f<N>/<name>/:
     results.csv           seed, function_id, best_error, evals_used
     baseline_config.yaml  the exact settings used (function/dim/budget/seeds +
                           the baseline's own constants)
@@ -209,8 +209,13 @@ def main():
     parser.add_argument("--sampling-box", type=int, default=2)
     parser.add_argument("--function", type=int, default=None,
                         help="Produce the baseline for a single function id, "
-                             "into baselines/f<id>/<name>/. Omit to produce it "
-                             "for every function in the config.")
+                             "into baselines/<exp>/f<id>/<name>/. Omit to produce "
+                             "it for every function in the config.")
+    parser.add_argument("--skip-existing", action="store_true",
+                        help="Skip a (function, baseline) whose results.csv "
+                             "already exists. Lets a job generate its baselines "
+                             "at start-up idempotently, so a resumed/restarted "
+                             "run does not recompute them.")
     args = parser.parse_args()
 
     cfg = Config.from_file(args.config, smoke=args.smoke)
@@ -224,8 +229,15 @@ def main():
     # folder so a per-function experiment job finds exactly its reference.
     for fid in functions:
         # Same path helper evaluate.py reads from, so producer and consumer
-        # never disagree; smoke baselines go to baselines/smoke/f<N>/<name>/.
-        out_dir = baseline_dir(args.baseline, fid, cfg.is_smoke)
+        # never disagree; baselines are namespaced by experiment
+        # (baselines/<exp_id>[/smoke]/f<N>/<name>/) because a baseline is only
+        # valid for the config that produced it.
+        out_dir = baseline_dir(args.baseline, fid, cfg.exp_id, cfg.is_smoke)
+        if args.skip_existing and os.path.exists(
+                os.path.join(out_dir, "results.csv")):
+            print(f"Skipping {args.baseline} for f{fid}: results.csv already "
+                  f"present in {out_dir}")
+            continue
         os.makedirs(out_dir, exist_ok=True)
 
         print(f"Producing {args.baseline} for f{fid}: dim={env.dim} "

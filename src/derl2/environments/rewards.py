@@ -26,6 +26,8 @@ a context dict:
 Errors below 1e-8 are taken as zero (CEC'13 protocol).
 """
 
+import math
+
 ERROR_FLOOR = 1e-8
 
 
@@ -80,10 +82,60 @@ class Stagnation:
         return float(reward)
 
 
+class LogStagnation:
+    """Log-improvement variant of Stagnation (EXP004).
+
+        R_t = (log10(e_{t-1}+c) − log10(e_t+c)) − λ·I[n_stag ≥ τ]·improved   (every t)
+            +  (−log10(e_0+c))                                              (only t = 1)
+
+    Same shape as Stagnation, but the per-segment reward is the reduction in
+    log10(error) instead of raw error. This makes a fixed FACTOR reduction worth
+    the same reward regardless of the absolute scale: an order of magnitude early
+    (1e7 → 1e6) earns the same +1 as one late (1e2 → 1e1). Two consequences:
+
+      * late-episode fine-tuning finally gets credit equal to early gains, so the
+        agent learns to value the whole trajectory rather than only segment 1
+        (under the raw reward the first segment dominates the return by ~5 orders
+        of magnitude on ill-conditioned functions);
+      * TD targets are bounded to a small range (~0–16) instead of ~0–1e7, which
+        is far kinder to the DQN's stability.
+
+    It preserves the telescoping objective: with the t=1 term, Σ R = −log10(e_final+c)
+    (before penalties), so maximizing return still minimizes final error — the
+    ordering over policies is identical to Stagnation's, only the scale changes.
+    c = ERROR_FLOOR keeps log finite when a segment solves the problem (e → 0).
+
+    NOTE: because rewards are now O(1) rather than O(1e6), the λ penalty (default
+    0.1) is on a comparable scale to a per-step reward for the first time — it is
+    an active term here, not the effectively-inert one it was under raw error.
+    """
+
+    name = "log_stagnation"
+
+    def __init__(self, lam=0.1, tau_stag=3, floor=ERROR_FLOOR):
+        self.lam = float(lam)
+        self.tau_stag = int(tau_stag)
+        self.floor = float(floor)
+
+    def __call__(self, ctx):
+        error_best = _clamp(ctx["error_best"])
+        error_new = _clamp(ctx["error_new"])
+        log_best = math.log10(error_best + self.floor)
+        log_new = math.log10(error_new + self.floor)
+
+        improved = error_new < error_best
+        penalty = self.lam if (improved and ctx["n_stag"] >= self.tau_stag) else 0.0
+        reward = (log_best - log_new) - penalty
+        if ctx["t"] == 1:
+            reward += -log_best
+        return float(reward)
+
+
 # --------------------------------------------------------------- registry
 
 REWARDS = {
     "stagnation": Stagnation,
+    "log_stagnation": LogStagnation,
 }
 
 

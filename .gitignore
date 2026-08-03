@@ -12,6 +12,11 @@ runs/
 slurm_logs/
 experiments/**/checkpoints/
 experiments/**/trajectories/
+# Generated analysis figures (scripts/analyze_experiment.py).
+tests/
+# Baselines are generated per-experiment by each job (run_experiment.sh, via
+# run_baseline --skip-existing); regenerable, rsync back if a local copy is wanted.
+baselines/
 *.bak.*
 
 scripts/MACHINERY.md

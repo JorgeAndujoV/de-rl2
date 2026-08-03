@@ -16,7 +16,10 @@
 #   --function N   submit one job for function N
 #   (no --function) submit one job per function in config.benchmark.functions
 # Such a config also does its evaluation IN-PROCESS at each checkpoint, so the
-# separate post-training eval step is skipped.
+# separate post-training eval step is skipped. Each per-function job first
+# generates its own function's baselines (evaluation.compare_against) into
+# baselines/<exp_id>/f<N>/ before training, so baselines are never shared across
+# experiments and never regenerated per checkpoint.
 #
 # Because the output path is fixed, a careless resubmit could destroy a completed
 # run, so a non-empty target is refused unless you say what to do:
@@ -103,6 +106,11 @@ TIME=$(python -m derl2.config --config "$CONFIG" slurm.time)
 # Per-function experiments declare training.periodic_eval; that flag also means
 # evaluation happens in-process (train.py), so the separate eval step is skipped.
 HAS_PERIODIC=$(python -c "from derl2.config import Config; print(Config.from_file('$CONFIG').get('training.periodic_eval.every', default=''))" 2>/dev/null || echo "")
+
+# Baseline method names (evaluation.compare_against), space-joined by python so
+# the shell never has to parse a YAML/py list. Each per-function job generates
+# these for its function before training (see the baseline block in the heredoc).
+BASELINES=$(python -c "from derl2.config import Config; print(' '.join(Config.from_file('$CONFIG').get('evaluation.compare_against')))" 2>/dev/null || echo "")
 
 # Walltime safety stop: checkpoint and exit at 90% of the requested time, rather
 # than being killed mid-episode by SLURM. Supports D-HH:MM:SS and HH:MM:SS.
@@ -278,6 +286,23 @@ python -m derl2.run_metadata start \\
     --out-dir "\${WORK_DIR}" --config "${CONFIG}" --kind "${KIND}" ${SMOKE_FLAG} \\
     --slurm-job-id "\${SLURM_JOB_ID}" --commit "${COMMIT}" ${DIRTY_FLAG} \\
     ${FUNC_SET} ${EXTRA_ARGS}
+
+# ---------------------------------------------------- baselines (job-generated)
+# Each per-function job produces THIS experiment's baselines for its function
+# ONCE, before training, into baselines/<exp>/f<N>/<method>/. repo_root is
+# \$HOME/de-rl2 (editable install), so they persist there and every one of the 10
+# checkpoint evaluations reuses the same frozen numbers — baselines are never
+# regenerated per checkpoint. --skip-existing makes a resumed job skip baselines
+# it already produced. A baseline is valid only for the exact config that made
+# it, so each experiment generates its own instead of sharing another's; a
+# failure here (before training) correctly fails the job via the persist trap.
+if [ -n "${FUNCTION}" ]; then
+    echo "==== BASELINES (f${FUNCTION}, generate-once, reused by all checkpoints) ===="
+    for BL in ${BASELINES}; do
+        python -m scripts.run_baseline --baseline \$BL \\
+            --config "${CONFIG}" --function ${FUNCTION} ${SMOKE_FLAG} --skip-existing
+    done
+fi
 
 echo "==== TRAINING ===="
 set +e

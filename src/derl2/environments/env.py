@@ -63,6 +63,13 @@ class DEEnv:
         self.box_min_frac = box_min_frac
         self.truncate_last_segment = truncate_last_segment
         self.n_checkpoints = n_checkpoints
+        # SMDP tau unit: the SMALLEST budget fraction in THIS experiment's menu,
+        # so tau is self-consistent within the experiment (one smallest segment
+        # = 1 tau). Derived from budget_fracs, not a hardcoded constant, so an
+        # experiment that changes the menu (e.g. EXP004's 0.025) also shifts its
+        # own discount unit rather than inheriting another experiment's. Used by
+        # the reward/tau block in step().
+        self.tau_frac = min(budget_fracs)
 
         self.observation = build_observation(observation)
         self.action = build_action_space(action_space, strategy_profiles,
@@ -245,14 +252,18 @@ class DEEnv:
         error_new = self._global_best_error
 
         # Reward uses the pre-update streak (see rewards.py); tau is elapsed
-        # budget in units of the smallest budget fraction, 5% (spec §6.5).
+        # budget in units of the smallest budget fraction of THIS experiment
+        # (self.tau_frac, spec §6.5) — a per-experiment-consistent unit, so the
+        # smallest agent segment is exactly 1 tau. Changing the budget menu (e.g.
+        # EXP004's 0.025) shifts this unit with it; the γ^τ horizon is therefore
+        # a property of each experiment's own configuration.
         reward = self.reward_fn({
             "t": self._t,
             "error_best": error_best_before,
             "error_new": error_new,
             "n_stag": n_stag_before,
         })
-        tau = seg.fes_used / (0.05 * self.budget)
+        tau = seg.fes_used / (self.tau_frac * self.budget)
 
         # Budget exhaustion is a genuine terminal state (spec §6.5): done when
         # the remainder cannot even seed another population.
