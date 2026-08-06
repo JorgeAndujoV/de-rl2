@@ -154,7 +154,23 @@ class Config:
             raise ConfigError(f"Config file must contain a mapping: {path}")
 
         if smoke:
-            data = _deep_merge(data, SMOKE_OVERRIDES)
+            # Scale everything except the agent block wholesale. For the agent
+            # block, scale ONLY keys the config already declares — otherwise a
+            # DQN-shaped smoke override (buffer_size, epsilon, ...) is injected
+            # into an agent whose constructor does not accept it (PPO/SAC have no
+            # buffer_size/epsilon; DQN/MP-DQN do), which build_agent rejects.
+            smoke_ovr = copy.deepcopy(SMOKE_OVERRIDES)
+            agent_ovr = smoke_ovr.pop("agent", {})
+            data = _deep_merge(data, smoke_ovr)
+            agent_cfg = data.get("agent")
+            if isinstance(agent_cfg, dict):
+                for k, v in agent_ovr.items():
+                    if k not in agent_cfg:
+                        continue                 # agent doesn't declare it -> skip
+                    if isinstance(v, dict) and isinstance(agent_cfg.get(k), dict):
+                        agent_cfg[k] = _deep_merge(agent_cfg[k], v)
+                    else:
+                        agent_cfg[k] = v
             data["smoke"] = True
             # If the experiment does periodic in-process evaluation, scale its
             # cadence down too — otherwise a 3-episode smoke never reaches
