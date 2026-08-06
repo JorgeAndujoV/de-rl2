@@ -29,6 +29,7 @@ import os
 import platform
 import socket
 import subprocess
+import tempfile
 from datetime import datetime, timezone
 
 from derl2.config import Config
@@ -48,6 +49,29 @@ _TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 def path_for(out_dir):
     return os.path.join(out_dir, METADATA_FILE)
+
+
+def atomic_write_text(path, text):
+    """Write `text` to `path` atomically: a temp file in the same directory,
+    then os.replace (atomic on POSIX and Windows). A concurrent reader therefore
+    always sees either the old complete file or the new one, never a truncated
+    half-write. This is required because SHARED baselines (evaluation.
+    baseline_namespace) can be produced by several jobs at once, all writing the
+    same run_metadata.json / results.csv / baseline_config.yaml — a plain
+    open('w') truncation is what crashed EXP010/011's baseline step."""
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-", suffix=".part")
+    try:
+        with os.fdopen(fd, "w", newline="") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _now_iso():
@@ -115,9 +139,7 @@ def _dump(meta, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     ordered = {k: meta[k] for k in _SCHEMA_ORDER if k in meta}
     ordered.update({k: v for k, v in meta.items() if k not in ordered})
-    with open(path_for(out_dir), "w") as fh:
-        json.dump(ordered, fh, indent=2)
-        fh.write("\n")
+    atomic_write_text(path_for(out_dir), json.dumps(ordered, indent=2) + "\n")
 
 
 def write_start(out_dir, cfg, kind, **kwargs):
@@ -140,10 +162,16 @@ def write_finish(out_dir, status):
     synthesises a minimal one so a failed job is still labelled.
     """
     path = path_for(out_dir)
+    meta = None
     if os.path.exists(path):
-        with open(path) as fh:
-            meta = json.load(fh)
-    else:
+        try:
+            with open(path) as fh:
+                meta = json.load(fh)
+        except (json.JSONDecodeError, ValueError, OSError):
+            # A concurrent writer may have left it mid-write; with atomic writes
+            # this is rare, but tolerate it rather than crash the job at finish.
+            meta = None
+    if meta is None:
         meta = {k: None for k in _SCHEMA_ORDER}
     meta["finished_at"] = _now_iso()
     meta["exit_status"] = status

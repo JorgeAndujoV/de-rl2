@@ -39,6 +39,7 @@ The three baselines:
 
 import argparse
 import csv
+import io
 import os
 
 import numpy as np
@@ -164,11 +165,14 @@ def run_random(cfg, functions, seeds):
 
 
 def write_results(out_dir, rows):
-    with open(os.path.join(out_dir, "results.csv"), "w", newline="") as fh:
-        w = csv.writer(fh)
-        w.writerow(RESULT_COLUMNS)
-        for seed, fid, best_error, evals_used in rows:
-            w.writerow([seed, fid, f"{best_error:.6e}", evals_used])
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(RESULT_COLUMNS)
+    for seed, fid, best_error, evals_used in rows:
+        w.writerow([seed, fid, f"{best_error:.6e}", evals_used])
+    # Atomic: shared baselines can be written by several jobs at once.
+    run_metadata.atomic_write_text(
+        os.path.join(out_dir, "results.csv"), buf.getvalue())
 
 
 def write_baseline_config(out_dir, name, cfg, functions, seeds, extra):
@@ -189,8 +193,9 @@ def write_baseline_config(out_dir, name, cfg, functions, seeds, extra):
         # Baseline-specific constants:
         **extra,
     }
-    with open(os.path.join(out_dir, "baseline_config.yaml"), "w") as fh:
-        yaml.safe_dump(payload, fh, default_flow_style=False, sort_keys=False)
+    run_metadata.atomic_write_text(
+        os.path.join(out_dir, "baseline_config.yaml"),
+        yaml.safe_dump(payload, default_flow_style=False, sort_keys=False))
 
 
 def main():
