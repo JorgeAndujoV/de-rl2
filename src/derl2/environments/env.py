@@ -45,6 +45,8 @@ class DEEnv:
                  warmup, box_center, box_scales, box_min_frac, elitism,
                  truncate_last_segment, observation, n_checkpoints,
                  action_space, budget_fracs, strategy_profiles, reward,
+                 budget_range=None, box_scale_range=None,
+                 f_range=None, cr_range=None,
                  exp_id=None, is_smoke=False):
         if elitism:
             raise ValueError(
@@ -64,17 +66,25 @@ class DEEnv:
         self.box_min_frac = box_min_frac
         self.truncate_last_segment = truncate_last_segment
         self.n_checkpoints = n_checkpoints
-        # SMDP tau unit: the SMALLEST budget fraction in THIS experiment's menu,
-        # so tau is self-consistent within the experiment (one smallest segment
-        # = 1 tau). Derived from budget_fracs, not a hardcoded constant, so an
-        # experiment that changes the menu (e.g. EXP004's 0.025) also shifts its
-        # own discount unit rather than inheriting another experiment's. Used by
-        # the reward/tau block in step().
-        self.tau_frac = min(budget_fracs)
-
         self.observation = build_observation(observation)
+        # Range kwargs are only meaningful to a continuous action space; a
+        # discrete one ignores them. Pass through only the ones the config set.
+        _as_kwargs = {}
+        for _name, _val in (("f_range", f_range), ("cr_range", cr_range),
+                            ("budget_range", budget_range),
+                            ("box_scale_range", box_scale_range)):
+            if _val is not None:
+                _as_kwargs[_name] = _val
         self.action = build_action_space(action_space, strategy_profiles,
-                                         budget_fracs)
+                                         budget_fracs, **_as_kwargs)
+
+        # SMDP tau unit: the SMALLEST budget fraction THIS experiment's action
+        # space can request, so tau is self-consistent within the experiment
+        # (one smallest segment = 1 tau). Read from the action space so a
+        # discrete menu (min of the list) and a continuous budget range (its
+        # lower bound) are handled uniformly; each experiment therefore sets its
+        # own discount unit. Used by the reward/tau block in step().
+        self.tau_frac = self.action.budget_min
         # exp_id/is_smoke are threaded through only for rewards that need to read
         # a frozen per-function baseline (median_stagnation -> m_i); every other
         # reward ignores them. lambda/tau_stag default so a reward config that
@@ -115,9 +125,13 @@ class DEEnv:
             observation=cfg.get("environment.observation"),
             n_checkpoints=cfg.get("environment.n_checkpoints"),
             action_space=cfg.get("environment.action_space"),
-            budget_fracs=cfg.get("environment.budget_fracs"),
+            budget_fracs=cfg.get("environment.budget_fracs", None),
             strategy_profiles=cfg.get("environment.strategy_profiles"),
             reward=cfg.get("environment.reward"),
+            budget_range=cfg.get("environment.budget_range", None),
+            box_scale_range=cfg.get("environment.box_scale_range", None),
+            f_range=cfg.get("environment.f_range", None),
+            cr_range=cfg.get("environment.cr_range", None),
             exp_id=cfg.exp_id,
             is_smoke=cfg.is_smoke,
         )
@@ -205,6 +219,7 @@ class DEEnv:
             "prev_CR": self.warmup["CR"],
             "prev_budget_frac": self.warmup_frac,
             "prev_sampling_box_index": None,      # warm-up used no box action
+            "prev_box_scale_norm": 0.0,           # ... and no continuous scale
             "current_box_width_frac": 1.0,        # it used the whole domain
         }
         obs = self.observation.build(ctx)
@@ -221,10 +236,22 @@ class DEEnv:
         self._t += 1
         decoded = self.action.decode(action)
 
+        # Resolve the box half-width multiplier: a continuous action space
+        # emits the scale directly; a discrete one emits an index into
+        # box_scales. prev_box_scale_norm is the scale normalized to [0,1] over
+        # the continuous range (0.0 for the discrete space, whose observation
+        # uses a box one-hot instead and ignores this feature).
+        if self.action.continuous_box:
+            box_scale = float(decoded["sampling_box"])
+            _blo, _bhi = self.action.ranges[3]
+            prev_box_scale_norm = (box_scale - _blo) / (_bhi - _blo + 1e-12)
+        else:
+            box_scale = self.box_scales[int(decoded["sampling_box"])]
+            prev_box_scale_norm = 0.0
+
         # Transform the previous segment's population into this segment's box.
         box = transform_box(
-            self._prev_segment.final_population, decoded["sampling_box"],
-            self.box_scales, self.box_min_frac,
+            self._prev_segment.final_population, box_scale, self.box_min_frac,
             self._domain_lo, self._domain_hi,
             self.box_center, self._global_best_solution,
         )
@@ -305,6 +332,7 @@ class DEEnv:
             "prev_CR": decoded["CR"],
             "prev_budget_frac": decoded["budget_frac"],
             "prev_sampling_box_index": decoded["sampling_box"],
+            "prev_box_scale_norm": prev_box_scale_norm,
             "current_box_width_frac": box_width_frac_initial,
         }
         next_obs = self.observation.build(ctx)

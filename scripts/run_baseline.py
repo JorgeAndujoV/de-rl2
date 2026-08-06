@@ -48,8 +48,8 @@ from derl2 import run_metadata
 from derl2.benchmarks import build_benchmark
 from derl2.config import Config
 from derl2.environments import DEEnv
-from derl2.evaluation.evaluate import (baseline_dir, fixed_policy,
-                                       random_policy, run_episode)
+from derl2.evaluation.evaluate import (baseline_dir, baseline_namespace,
+                                       fixed_policy, random_policy, run_episode)
 from derl2.optimizers import run_segment
 
 DE_PLAIN = "BASE001_de_plain"
@@ -232,7 +232,8 @@ def main():
         # never disagree; baselines are namespaced by experiment
         # (baselines/<exp_id>[/smoke]/f<N>/<name>/) because a baseline is only
         # valid for the config that produced it.
-        out_dir = baseline_dir(args.baseline, fid, cfg.exp_id, cfg.is_smoke)
+        out_dir = baseline_dir(args.baseline, fid, baseline_namespace(cfg),
+                               cfg.is_smoke)
         if args.skip_existing and os.path.exists(
                 os.path.join(out_dir, "results.csv")):
             print(f"Skipping {args.baseline} for f{fid}: results.csv already "

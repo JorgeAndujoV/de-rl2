@@ -39,7 +39,6 @@ from derl2.config import Config, experiments_dir
 from derl2.environments import DEEnv
 from derl2.evaluation.evaluate import (check_baselines_available,
                                        evaluate_policy)
-from derl2.replay import ReplayBuffer
 
 # Seed offset for the greedy evaluation rollouts run during training. Kept well
 # clear of training seeds (seed·1e6 + episode) and of final-eval seeds
@@ -110,7 +109,13 @@ def main():
     agent_name = agent_block.pop("name")
     agent = build_agent(agent_name, env.obs_dim, env.n_actions, agent_block,
                         seed=seed)
-    buffer = ReplayBuffer(agent.buffer_size, env.obs_dim, seed=seed)
+    # The agent owns its replay format (a scalar-action buffer for DQN, a
+    # (k, params) buffer for parameterized agents), so this stays agent-agnostic.
+    # On-policy agents (PPO) have no replay buffer — they collect a fresh rollout
+    # each update — so none is built for them.
+    on_policy = getattr(agent, "on_policy", False)
+    buffer = None if on_policy else agent.make_buffer(agent.buffer_size,
+                                                      env.obs_dim, seed=seed)
 
     commit = git_commit()
     print(cfg.summary())
@@ -148,12 +153,12 @@ def main():
     buffer_path = os.path.join(ckpts_dir, "replay_buffer.npz")
     if manager.latest_checkpoint:
         ckpt.restore(manager.latest_checkpoint)
-        if os.path.exists(buffer_path):
+        if buffer is not None and os.path.exists(buffer_path):
             buffer.load(buffer_path)
         print(f"Resumed from {manager.latest_checkpoint} "
               f"(episode {int(episode_var.numpy())}, "
               f"best_eval {float(best_eval_var.numpy()):.4e}, "
-              f"buffer {buffer.size})")
+              f"buffer {buffer.size if buffer is not None else 'n/a (on-policy)'})")
 
     log_path = os.path.join(out_dir, "training_log.csv")
     write_header = not os.path.exists(log_path)
@@ -168,8 +173,9 @@ def main():
     eval_every = cfg.get("training.eval_every")
     eval_episodes = cfg.get("training.eval_episodes")
     checkpoint_every = cfg.get("training.checkpoint_every")
-    batch_size = agent.batch_size
-    warmup = agent.warmup_transitions
+    # Replay settings — used only by the off-policy loop; absent on PPO.
+    batch_size = getattr(agent, "batch_size", None)
+    warmup = getattr(agent, "warmup_transitions", None)
 
     # Episode-based periodic checkpoint+evaluation (EXP003): every
     # `periodic_eval.every` episodes from `periodic_eval.start`, save a named
@@ -255,6 +261,105 @@ def main():
               f"ep_len {(np.mean(lengths) if lengths else float('nan')):.1f} | "
               f"{time.perf_counter() - t_start:.0f}s", flush=True)
         returns.clear(); lengths.clear(); losses.clear()
+
+    # --------------------------------------------------- on-policy loop (PPO)
+    def run_on_policy_training():
+        """Collect rollouts from n_envs parallel DEEnv copies, compute SMDP-GAE
+        per env stream, and do a PPO update — reusing the SAME checkpoint / eval
+        / logging / walltime cadence as the off-policy loop below. No replay
+        buffer; evaluation stays single-env greedy (log_checkpoint and
+        periodic_checkpoint), so every output file is identical in shape."""
+        nonlocal next_eval_at, next_ckpt_at
+        from derl2.environments.vec_env import make_vec_env
+        from derl2.agents.hybrid_ppo import compute_gae
+
+        n_envs = agent.n_envs
+        per_env = max(1, agent.rollout_steps // n_envs)
+        venv = make_vec_env(cfg, n_envs, base_seed=seed,
+                            backend=cfg.get("environment.vec_backend", None))
+        obs = venv.reset()
+        completed = start
+        k_done = (start // periodic_every) if periodic_every else 0
+        ep_ret = [0.0] * n_envs
+        ep_len = [0] * n_envs
+        try:
+            while completed < episodes:
+                # ---- collect: per_env steps from each of n_envs streams ----
+                streams = [[] for _ in range(n_envs)]
+                for _t in range(per_env):
+                    acts, logps, vals = [], [], []
+                    for i in range(n_envs):
+                        a, lp, v = agent.act_collect(obs[i])
+                        acts.append(a); logps.append(lp); vals.append(v)
+                    next_obs, rewards, dones, infos = venv.step(acts)
+                    for i in range(n_envs):
+                        streams[i].append(
+                            (obs[i], acts[i][0], acts[i][1], logps[i], vals[i],
+                             float(rewards[i]), float(dones[i]),
+                             float(infos[i]["tau"])))
+                        ep_ret[i] += float(rewards[i]); ep_len[i] += 1
+                        if dones[i] > 0.5:
+                            returns.append(ep_ret[i]); lengths.append(ep_len[i])
+                            ep_ret[i] = 0.0; ep_len[i] = 0
+                            completed += 1
+                    obs = next_obs
+
+                # ---- per-stream SMDP-GAE, then one PPO update ----
+                cols = {k: [] for k in ("obs", "k", "params", "logp", "adv", "ret")}
+                for i in range(n_envs):
+                    s = streams[i]
+                    last_v = agent.value(obs[i])
+                    adv, ret = compute_gae(
+                        [r[5] for r in s], [r[4] for r in s], [r[6] for r in s],
+                        [r[7] for r in s], last_v, agent.gamma,
+                        agent.gae_lambda, agent.per_budget)
+                    cols["obs"] += [r[0] for r in s]
+                    cols["k"] += [r[1] for r in s]
+                    cols["params"] += [r[2] for r in s]
+                    cols["logp"] += [r[3] for r in s]
+                    cols["adv"] += list(adv); cols["ret"] += list(ret)
+                loss = agent.update({
+                    "obs": np.asarray(cols["obs"], dtype=np.float32),
+                    "k": np.asarray(cols["k"], dtype=np.int32),
+                    "params": np.asarray(cols["params"], dtype=np.float32),
+                    "old_logp": np.asarray(cols["logp"], dtype=np.float32),
+                    "adv": np.asarray(cols["adv"], dtype=np.float32),
+                    "ret": np.asarray(cols["ret"], dtype=np.float32)})
+                losses.append(loss)
+                episode_var.assign(completed)
+
+                # ---- cadence: eval/ckpt on train steps, periodic on episodes ----
+                ts = int(agent.train_steps.numpy())
+                if ts >= next_ckpt_at:
+                    manager.save(); next_ckpt_at += checkpoint_every
+                if ts >= next_eval_at:
+                    log_checkpoint(); next_eval_at += eval_every
+                if periodic_every:
+                    while (k_done + 1) * periodic_every <= completed and \
+                            (k_done + 1) * periodic_every >= periodic_start:
+                        k_done += 1
+                        periodic_checkpoint(k_done, completed)
+
+                # ---- cluster walltime safety ----
+                if args.max_hours and (time.perf_counter() - t_start) / 3600.0 \
+                        > args.max_hours:
+                    manager.save(); venv.close(); log_file.close()
+                    print(f"Walltime limit reached at episode {completed}; "
+                          f"checkpointed. Re-run the same command to resume.")
+                    sys.exit(42)
+        finally:
+            venv.close()
+
+        if returns or losses:
+            log_checkpoint()
+        manager.save()
+        final_manager.save()
+        log_file.close()
+        print(f"Training finished. Output in {out_dir}")
+
+    if on_policy:
+        run_on_policy_training()
+        return
 
     for episode in range(start, episodes):
         obs, _ = env.reset(seed=seed * 1_000_000 + episode)

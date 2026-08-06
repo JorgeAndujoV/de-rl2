@@ -123,6 +123,13 @@ class DQNAgent:
             self.target_net.set_weights(self.q_net.get_weights())
         return float(loss.numpy())
 
+    # ------------------------------------------------------------ plumbing
+    def make_buffer(self, capacity, obs_dim, seed=0):
+        """The replay format this agent needs (a scalar-action buffer). train.py
+        asks the agent for its buffer so it never names a concrete buffer class."""
+        from derl2.replay import ReplayBuffer
+        return ReplayBuffer(capacity, obs_dim, seed=seed)
+
     # ------------------------------------------------------ checkpointing
     def checkpoint_items(self):
         """Objects tf.train.Checkpoint should track, so train.py doesn't need

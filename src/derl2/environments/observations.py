@@ -83,7 +83,9 @@ class Traj20:
     N_BOXES = 5
     dim = 4 * K + 6 + (6 + N_STRATEGIES + N_BOXES)   # 80 + 6 + 15 = 101
 
-    def build(self, ctx):
+    def _blocks_ab(self, ctx):
+        """Blocks A (trajectory, 80) and B (segment outcome, 6) = 86 features,
+        shared by traj20 and its variants, which differ only in Block C."""
         traj = np.asarray(ctx["trajectory"], dtype=np.float64)
         if traj.shape != (self.K, 5):
             raise ValueError(
@@ -137,6 +139,10 @@ class Traj20:
                    / (ctx["box_width_full_initial"] + EPS))
         b6 = float(np.log10(ctx["global_best_error"] + 1e-12))
         block_b = np.array([b1, b2, b3, b4, b5, b6], dtype=np.float32)
+        return np.concatenate([block_a, block_b]).astype(np.float32)
+
+    def build(self, ctx):
+        block_ab = self._blocks_ab(ctx)
 
         # ---- Block C: context (15) ----
         block_c = np.concatenate([
@@ -150,13 +156,53 @@ class Traj20:
             np.array([ctx["current_box_width_frac"]], dtype=np.float32),  # C4
         ]).astype(np.float32)
 
-        return np.concatenate([block_a, block_b, block_c]).astype(np.float32)
+        return np.concatenate([block_ab, block_c]).astype(np.float32)
+
+
+class Traj20ContBox(Traj20):
+    """traj20 for a continuous sampling-box scale (spec §6.2 variant).
+
+    Identical to traj20 in Blocks A and B and in every Block-C feature EXCEPT
+    the previous box action: a continuous box-scale cannot be one-hot encoded,
+    so the 5-way box one-hot (C3e) is replaced by a single normalized scalar
+    ``prev_box_scale_norm`` in [0, 1] (the environment normalizes the scale by
+    its configured box_scale_range; the warmup that precedes step 1 has no box
+    action and contributes 0.0, matching the all-zeros one-hot convention).
+
+    Block C is therefore 11 wide (was 15), so dim = 80 + 6 + 11 = 97. The
+    previous strategy/F/CR/budget are all still present, so the full previous
+    action remains in the observation. Pairs with the param_strategy_continuous
+    action space.
+    """
+
+    name = "traj20_contbox"
+    dim = 4 * Traj20.K + 6 + (6 + Traj20.N_STRATEGIES + 1)   # 80 + 6 + 11 = 97
+
+    def build(self, ctx):
+        # Reuse the parent's Blocks A and B (via the shared helper, NOT the
+        # parent build() — that reads the box one-hot, which a continuous scale
+        # cannot index), then append a Block C that uses the scalar box feature.
+        block_ab = self._blocks_ab(ctx)
+
+        block_c = np.concatenate([
+            np.array([ctx["budget_remaining_frac"]], dtype=np.float32),   # C1
+            np.array([ctx["n_steps_taken"] / 19.0], dtype=np.float32),    # C2
+            _one_hot(ctx["prev_strategy_index"], self.N_STRATEGIES),      # C3a
+            np.array([ctx["prev_F"]], dtype=np.float32),                  # C3b
+            np.array([ctx["prev_CR"]], dtype=np.float32),                 # C3c
+            np.array([ctx["prev_budget_frac"]], dtype=np.float32),        # C3d
+            np.array([ctx["prev_box_scale_norm"]], dtype=np.float32),     # C3e
+            np.array([ctx["current_box_width_frac"]], dtype=np.float32),  # C4
+        ]).astype(np.float32)
+
+        return np.concatenate([block_ab, block_c]).astype(np.float32)
 
 
 # --------------------------------------------------------------- registry
 
 OBSERVATIONS = {
     "traj20": Traj20,
+    "traj20_contbox": Traj20ContBox,
 }
 
 

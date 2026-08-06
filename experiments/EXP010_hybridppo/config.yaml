@@ -1,0 +1,100 @@
+experiment: EXP010_hybridppo
+seed: 0
+
+# EXP010: Hybrid PPO on the SAME expanded action space as EXP009 (the agent sets
+# F, CR, a continuous budget up to 0.95 and a continuous box scale up to 3.0; the
+# strategy is a discrete choice, never fixed). Only the AGENT differs from
+# EXP009 — the environment, action space, observation, reward and baselines are
+# identical, so 009 (MP-DQN, off-policy value-based) vs 010 (PPO, on-policy
+# policy-gradient) is a clean agent-family comparison on the same problem.
+#
+# Policy: factorized and state-conditioned — Categorical(strategy) x
+# Beta(F) x Beta(CR) x Beta(budget) x Beta(box); a separate value net for the
+# PPO baseline; advantages via SMDP-GAE (gamma**tau per transition). On-policy,
+# so no replay buffer; transitions are collected from n_envs parallel copies of
+# the SAME DEEnv (a training-throughput device only — evaluation stays single-
+# env greedy, so every eval output and the analysis pipeline are unchanged).
+
+benchmark:
+  name: cec13
+  functions: [2, 6, 11, 12, 17, 3, 7, 15, 10, 16, 22]
+  dim: 30
+  budget: 300000
+
+episode:
+  pop_size: 50
+  warmup_frac: 0.05
+  warmup:
+    strategy: rand/1/bin
+    F: 0.5
+    CR: 0.9
+  box_center: centroid
+  box_scales: [1.0]            # unused (continuous box; see box_scale_range)
+  box_min_frac: 0.0417
+  elitism: false
+  truncate_last_segment: true
+
+environment:                   # identical to EXP009
+  observation: traj20_contbox
+  n_checkpoints: 20
+  action_space: param_strategy_continuous
+  f_range: [0.0, 1.0]
+  cr_range: [0.0, 1.0]
+  budget_range: [0.05, 0.95]
+  box_scale_range: [0.25, 3.0]
+  strategy_profiles:
+    - {strategy: rand/1/bin}
+    - {strategy: best/1/bin}
+    - {strategy: current-to-best/1/bin}
+    - {strategy: rand/2/bin}
+  reward:
+    name: log_stagnation       # log-improvement + stagnation penalty (as EXP009)
+    lambda: 0.1
+    tau_stag: 3
+
+# Hybrid PPO (src/derl2/agents/hybrid_ppo.py). On-policy: collect rollout_steps
+# transitions (across n_envs parallel envs) -> SMDP-GAE -> `epochs` of clipped-
+# surrogate minibatch SGD. Beta heads (alpha,beta = softplus+1). lr is the PPO-
+# standard 3e-4 (below the value-based 1e-3).
+agent:
+  name: hybrid_ppo
+  param_dim: 4                 # F, CR, budget_frac, box_scale
+  discounting: per_budget
+  gamma: 0.99
+  gae_lambda: 0.95
+  lr: 3.0e-4
+  policy_hidden: [128, 128]
+  value_hidden: [128, 128]
+  clip: 0.2
+  epochs: 10
+  minibatch_size: 64
+  entropy_coef: 0.01
+  value_coef: 0.5
+  max_grad_norm: 0.5
+  rollout_steps: 512           # transitions per update, summed over all envs
+  n_envs: 8                    # parallel DEEnv copies for collection throughput
+
+training:
+  episodes: 10000
+  eval_every: 2000
+  eval_episodes: 10
+  checkpoint_every: 2000
+  periodic_eval:
+    start: 1000
+    every: 1000
+
+evaluation:
+  runs_per_function: 51
+  seed_offset: 900000
+  save_trajectory_seeds: 3
+  # Shares ONE baseline set with EXP009/EXP011 (same env + action space): plain DE
+  # + a random agent sampled from the shared action space. Fixed-schedule dropped.
+  baseline_namespace: CONT_ACTION_BASELINES
+  compare_against: [BASE001_de_plain, BASE003_random]
+
+slurm:
+  time: "5-00:00:00"
+  mem: "16G"
+  cpus: 8                       # matches n_envs; each worker pinned to 1 TF thread
+  gpus: 0
+  account: def-bolufe

@@ -59,9 +59,12 @@ def fixed_policy(action):
 
 
 def random_policy(action_space, seed=12345):
-    """Uniform random action every step, seeded for reproducibility."""
+    """Uniform random action every step, seeded for reproducibility. Each action
+    space defines its own uniform sample (a discrete index for the discrete
+    space, a (strategy, [0,1]^param_dim) pair for the parameterized one), so the
+    random baseline matches whatever action space the experiment uses."""
     rng = np.random.default_rng(seed)
-    return lambda obs: int(rng.integers(action_space.n))
+    return lambda obs: action_space.sample_random(rng)
 
 
 # ----------------------------------------------------------- schemas
@@ -172,6 +175,18 @@ def baseline_dir(name, function_id, exp_id, smoke=False):
     return os.path.join(*parts)
 
 
+def baseline_namespace(cfg):
+    """The baselines folder an experiment reads/writes. Defaults to the
+    experiment id (the per-experiment namespacing baseline_dir documents), but an
+    experiment may set evaluation.baseline_namespace to SHARE a baseline set with
+    other experiments that are byte-identical in everything a baseline depends on
+    — dim, budget, pop, warmup, seeds, and (for BASE003) the action space. The
+    reward and the agent never affect a baseline, so EXP009/010/011 (same env,
+    same continuous action space) can and do share one namespace. check_parity
+    still guards function/dim/budget/seeds, so a mismatched share fails loudly."""
+    return cfg.get("evaluation.baseline_namespace", default=cfg.exp_id)
+
+
 def _missing_baseline_error(name, path, function_id, smoke=False):
     smoke_flag = " --smoke" if smoke else ""
     return FileNotFoundError(
@@ -213,9 +228,10 @@ def check_baselines_available(cfg, functions):
     evaluation mid-training must never be the thing that discovers a missing
     baseline and kills a multi-day job. A smoke run checks the smoke tree."""
     compare_against = cfg.get("evaluation.compare_against")
+    ns = baseline_namespace(cfg)
     for fid in functions:
         for name in compare_against:
-            d = baseline_dir(name, fid, cfg.exp_id, cfg.is_smoke)
+            d = baseline_dir(name, fid, ns, cfg.is_smoke)
             if not os.path.exists(os.path.join(d, "results.csv")):
                 raise _missing_baseline_error(name, d, fid, cfg.is_smoke)
 
@@ -386,12 +402,13 @@ def evaluate_policy(cfg, env, policy, out_dir):
     keys = sorted(agent_by_seed)
 
     seed_list = [offset + i for i in range(runs)]
+    ns = baseline_namespace(cfg)
     baselines = {name: {} for name in compare_against}
     for fid in env.functions:
         expected = {"functions": [fid], "dim": env.dim,
                     "budget": env.budget, "seeds": sorted(seed_list)}
         for name in compare_against:
-            by_seed, baseline_cfg = load_baseline(name, fid, cfg.exp_id,
+            by_seed, baseline_cfg = load_baseline(name, fid, ns,
                                                   cfg.is_smoke)
             check_parity(name, baseline_cfg, expected)
             baselines[name].update(by_seed)

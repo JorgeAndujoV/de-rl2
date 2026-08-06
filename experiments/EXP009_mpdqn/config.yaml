@@ -1,0 +1,111 @@
+experiment: EXP009_mpdqn
+seed: 0
+
+# EXP009-EXP011 expand the ACTION SPACE: the agent now sets F and CR
+# independently and continuously, chooses a continuous budget fraction up to
+# 0.95 (so it can run one long, near-uninterrupted segment on functions like f2)
+# and a continuous sampling-box scale up to 3.0. The strategy stays a DISCRETE
+# choice (never fixed) — for MP-DQN it is the parameterized-action backbone.
+#
+# EXP009's agent: MP-DQN (multi-pass parameterized DQN). Discrete action =
+# strategy (K=4); each strategy carries a continuous parameter vector
+# [F, CR, budget_frac, box_scale] produced by an actor network. Off-policy, so
+# it reuses the replay buffer; the buffer + counters persist on checkpoint so a
+# later experiment can CONTINUE this training past 10k episodes.
+#
+# Benchmark: the 11-function informative set (f8 Ackley and f24 Comp-4 dropped
+# as non-discriminating; f3/f7/f10/f15/f16/f22 added; f10/f16/f22 to be
+# confirmed by the baseline screen). Reward: log_stagnation (log-improvement +
+# stagnation penalty), the EXP005 winner. Baselines: plain DE + a random agent
+# sampled from THIS action space (fixed-schedule dropped as trivial here).
+
+benchmark:
+  name: cec13
+  functions: [2, 6, 11, 12, 17, 3, 7, 15, 10, 16, 22]
+  dim: 30
+  budget: 300000               # total FEs per episode
+
+episode:
+  pop_size: 50
+  warmup_frac: 0.05
+  warmup:
+    strategy: rand/1/bin
+    F: 0.5
+    CR: 0.9
+  box_center: centroid
+  box_scales: [1.0]            # unused: the box scale is continuous (see
+                              # environment.box_scale_range). Kept so
+                              # from_config's episode.box_scales read succeeds.
+  box_min_frac: 0.0417         # 1/24 — the collapse floor still applies
+  elitism: false
+  truncate_last_segment: true
+
+environment:
+  observation: traj20_contbox  # 97 features: traj20 with a scalar box feature
+  n_checkpoints: 20
+  action_space: param_strategy_continuous
+  # Continuous parameter ranges the agent's raw [0,1] outputs map onto:
+  f_range: [0.0, 1.0]
+  cr_range: [0.0, 1.0]
+  budget_range: [0.05, 0.95]   # up to a near-full-budget single run (f2)
+  box_scale_range: [0.25, 3.0]
+  # Strategy is the discrete backbone; only the name is read (the agent sets
+  # F/CR), so the F/CR here are ignored placeholders.
+  strategy_profiles:
+    - {strategy: rand/1/bin}
+    - {strategy: best/1/bin}
+    - {strategy: current-to-best/1/bin}
+    - {strategy: rand/2/bin}
+  reward:
+    name: log_stagnation       # log-improvement + stagnation penalty (EXP005)
+    lambda: 0.1
+    tau_stag: 3
+
+# MP-DQN (src/derl2/agents/mpdqn.py): actor (obs -> K*param_dim raw params in
+# [0,1]) + critic (obs+params -> K Q-values, scored multi-pass). Discrete
+# strategy is epsilon-greedy; continuous params get decaying Gaussian noise.
+# Stability: gradient clipping, double-Q target, TD3-style target smoothing.
+agent:
+  name: mpdqn
+  param_dim: 4                 # F, CR, budget_frac, box_scale (= action.param_dim)
+  discounting: per_budget
+  gamma: 0.99
+  lr: 1.0e-3
+  actor_hidden: [128, 128]
+  critic_hidden: [128, 128]
+  buffer_size: 100000
+  batch_size: 64
+  target_update: 500
+  warmup_transitions: 100
+  grad_clip_norm: 10.0         # stability guardrail (divergence seen in EXP004)
+  double_q: true
+  target_smooth_std: 0.1       # TD3-style smoothing on the continuous params
+  epsilon: {start: 1.0, end: 0.05, decay_steps: 40000}   # discrete strategy
+  param_noise: {start: 0.3, end: 0.05, decay_steps: 40000}  # continuous params
+
+training:
+  episodes: 10000
+  eval_every: 2000
+  eval_episodes: 10
+  checkpoint_every: 2000
+  periodic_eval:
+    start: 1000
+    every: 1000
+
+evaluation:
+  runs_per_function: 51
+  seed_offset: 900000
+  save_trajectory_seeds: 3
+  # Fixed-schedule dropped. Plain DE is action-independent and BASE003 random is
+  # sampled from the action space EXP009/010/011 all share, so the three
+  # experiments read/write ONE baseline set (generate once, reuse). check_parity
+  # still guards function/dim/budget/seeds.
+  baseline_namespace: CONT_ACTION_BASELINES
+  compare_against: [BASE001_de_plain, BASE003_random]
+
+slurm:
+  time: "5-00:00:00"
+  mem: "16G"
+  cpus: 4
+  gpus: 0
+  account: def-bolufe

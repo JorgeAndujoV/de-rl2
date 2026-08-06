@@ -1,0 +1,98 @@
+experiment: EXP011_hybridsac
+seed: 0
+
+# EXP011: Hybrid SAC on the SAME expanded action space as EXP009/EXP010 (agent
+# sets F, CR, a continuous budget up to 0.95, a continuous box scale up to 3.0;
+# strategy is a discrete choice, never fixed). Only the AGENT differs — env,
+# action space, observation, reward and baselines are identical.
+#
+# SAC is OFF-POLICY, so it reuses the ParamReplayBuffer and the ordinary
+# off-policy training loop unchanged (no vectorized envs). Policy: Categorical
+# (strategy) + squashed-Gaussian continuous params, state-conditioned (shared
+# across strategies, as in EXP010). Twin critics with Polyak-averaged targets;
+# the discrete part uses the exact discrete-SAC expectation over strategies; two
+# auto-tuned entropy temperatures. Entropy regularization + twin critics make
+# this the most stable of the three agents (contrast the EXP004 divergence).
+
+benchmark:
+  name: cec13
+  functions: [2, 6, 11, 12, 17, 3, 7, 15, 10, 16, 22]
+  dim: 30
+  budget: 300000
+
+episode:
+  pop_size: 50
+  warmup_frac: 0.05
+  warmup:
+    strategy: rand/1/bin
+    F: 0.5
+    CR: 0.9
+  box_center: centroid
+  box_scales: [1.0]            # unused (continuous box; see box_scale_range)
+  box_min_frac: 0.0417
+  elitism: false
+  truncate_last_segment: true
+
+environment:                   # identical to EXP009/EXP010
+  observation: traj20_contbox
+  n_checkpoints: 20
+  action_space: param_strategy_continuous
+  f_range: [0.0, 1.0]
+  cr_range: [0.0, 1.0]
+  budget_range: [0.05, 0.95]
+  box_scale_range: [0.25, 3.0]
+  strategy_profiles:
+    - {strategy: rand/1/bin}
+    - {strategy: best/1/bin}
+    - {strategy: current-to-best/1/bin}
+    - {strategy: rand/2/bin}
+  reward:
+    name: log_stagnation       # log-improvement + stagnation penalty (as 009/010)
+    lambda: 0.1
+    tau_stag: 3
+
+# Hybrid SAC (src/derl2/agents/hybrid_sac.py). Off-policy, ParamReplayBuffer.
+# Twin critics (obs+params -> K), Polyak targets (tau_polyak), squashed-Gaussian
+# continuous actor + categorical strategy, two auto-tuned temperatures
+# (target_entropy_disc_ratio * log K, and target_entropy_cont = -param_dim).
+agent:
+  name: hybrid_sac
+  param_dim: 4                 # F, CR, budget_frac, box_scale
+  discounting: per_budget
+  gamma: 0.99
+  lr: 3.0e-4
+  actor_hidden: [256, 256]
+  critic_hidden: [256, 256]
+  buffer_size: 100000
+  batch_size: 256
+  warmup_transitions: 1000
+  tau_polyak: 0.995            # target <- 0.995*target + 0.005*online
+  initial_alpha: 0.1
+  target_entropy_disc_ratio: 0.5   # target discrete entropy = 0.5 * log(K)
+  # target_entropy_cont defaults to -param_dim
+  max_grad_norm: 10.0
+
+training:
+  episodes: 10000
+  eval_every: 2000
+  eval_episodes: 10
+  checkpoint_every: 2000
+  periodic_eval:
+    start: 1000
+    every: 1000
+
+evaluation:
+  runs_per_function: 51
+  seed_offset: 900000
+  save_trajectory_seeds: 3
+  # Shares ONE baseline set with EXP009/EXP010 (same env + action space): plain DE
+  # + a random agent sampled from the shared action space. Fixed-schedule dropped.
+  baseline_namespace: CONT_ACTION_BASELINES
+  compare_against: [BASE001_de_plain, BASE003_random]
+
+slurm:
+  time: "5-00:00:00"
+  mem: "16G"
+  cpus: 4
+  gpus: 0
+  account: def-bolufe

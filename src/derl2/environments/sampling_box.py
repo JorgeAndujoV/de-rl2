@@ -39,14 +39,16 @@ class SamplingBox:
     incumbent_in_box: bool      # does best-so-far lie inside [box_lo, box_hi]?
 
 
-def transform_box(final_population, action_index, scales, box_min_frac,
+def transform_box(final_population, scale, box_min_frac,
                   domain_lo, domain_hi, box_center, incumbent):
     """Build the next segment's sampling box.
 
     final_population : (NP, D) previous segment's final population
-    action_index     : chosen sampling_box index (0..len(scales)-1)
-    scales           : per-index half-width multipliers, from config
-                       (episode.box_scales, e.g. [2.0, 1.5, 1.0, 0.667, 0.5])
+    scale            : half-width multiplier for this segment. The caller
+                       resolves it: a discrete action space looks the index up
+                       in episode.box_scales; a continuous one passes the
+                       agent's scale float directly. Decoupling the lookup from
+                       the geometry lets both action shapes share this transform.
     box_min_frac     : collapse floor as a fraction of the domain half-width
                        (episode.box_min_frac, 1/24 ≈ 0.0417)
     domain_lo, domain_hi : (D,) true search domain, for the floor and the clip
@@ -73,7 +75,7 @@ def transform_box(final_population, action_index, scales, box_min_frac,
         )
 
     # 3. scale the half-width by the action's factor
-    scaled = scales[action_index] * half_width
+    scaled = scale * half_width
 
     # 4. floor: never collapse below box_min_frac of the domain half-width
     domain_half_width = (domain_hi - domain_lo) / 2.0
