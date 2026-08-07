@@ -30,12 +30,42 @@ class BenchmarkSpec:
 
 _SUITE_BUILDERS = {}
 
+# Some CEC'13 functions are steep enough to overflow float32 near the domain
+# edges (e.g. f7 Schaffers reaches ~1e19 at dim 30, and edge points go Inf/NaN).
+# An Inf/NaN fitness propagates into the trajectory -> the log-fitness
+# observation features -> the agent's network, killing the job. We map a
+# non-finite value to a large FINITE penalty: DE then ranks the point worst and
+# rejects it, and no downstream error/observation is ever NaN/Inf. Finite values
+# are untouched, so this changes results only on points that would otherwise
+# crash (which are astronomically bad and get rejected anyway).
+_OVERFLOW_PENALTY = 1.0e30
+
 
 def register_suite(suite, builder):
     """builder(name, dim) -> BenchmarkSpec"""
     if suite in _SUITE_BUILDERS:
         raise KeyError(f"Suite {suite!r} already registered.")
     _SUITE_BUILDERS[suite] = builder
+
+
+def _sanitize_spec(spec):
+    """Return `spec` with its evaluators guarded against non-finite outputs."""
+    import numpy as np
+    import tensorflow as tf
+    from dataclasses import replace
+    pen = _OVERFLOW_PENALTY
+    eval_tf_raw, eval_np_raw = spec.evaluate_tf, spec.evaluate_np
+
+    def evaluate_tf(x):
+        y = eval_tf_raw(x)
+        return tf.where(tf.math.is_finite(y), y,
+                        tf.fill(tf.shape(y), tf.cast(pen, y.dtype)))
+
+    def evaluate_np(x):
+        y = eval_np_raw(x)
+        return y if np.isfinite(y) else pen
+
+    return replace(spec, evaluate_tf=evaluate_tf, evaluate_np=evaluate_np)
 
 
 def build_benchmark(benchmark_id, dim):
@@ -51,7 +81,7 @@ def build_benchmark(benchmark_id, dim):
             f"Unknown suite {suite!r} in {benchmark_id!r}. "
             f"Available: {sorted(_SUITE_BUILDERS)}."
         )
-    return _SUITE_BUILDERS[suite](name, dim)
+    return _sanitize_spec(_SUITE_BUILDERS[suite](name, dim))
 
 
 # Imported for registration side effects; kept at the bottom so the functions
