@@ -47,6 +47,7 @@ class DEEnv:
                  action_space, budget_fracs, strategy_profiles, reward,
                  budget_range=None, box_scale_range=None,
                  f_range=None, cr_range=None,
+                 np_range=None, box_centers=None,
                  exp_id=None, is_smoke=False):
         if elitism:
             raise ValueError(
@@ -72,7 +73,8 @@ class DEEnv:
         _as_kwargs = {}
         for _name, _val in (("f_range", f_range), ("cr_range", cr_range),
                             ("budget_range", budget_range),
-                            ("box_scale_range", box_scale_range)):
+                            ("box_scale_range", box_scale_range),
+                            ("np_range", np_range), ("box_centers", box_centers)):
             if _val is not None:
                 _as_kwargs[_name] = _val
         self.action = build_action_space(action_space, strategy_profiles,
@@ -85,6 +87,14 @@ class DEEnv:
         # lower bound) are handled uniformly; each experiment therefore sets its
         # own discount unit. Used by the reward/tau block in step().
         self.tau_frac = self.action.budget_min
+        # Population size: fixed (self.pop_size) unless the action space lets the
+        # agent choose NP per segment (param_strategy_boxnp). np_norm feeds the
+        # observation's prev_NP feature; np_min is the smallest population the
+        # agent can request and is the reference for the episode-terminal "can
+        # another population even be seeded?" test. Both fall back so every
+        # existing (fixed-NP) action space is unaffected.
+        self._has_np_action = hasattr(self.action, "np_norm")
+        self._np_min = int(getattr(self.action, "np_min", self.pop_size))
         # exp_id/is_smoke are threaded through only for rewards that need to read
         # a frozen per-function baseline (median_stagnation -> m_i); every other
         # reward ignores them. lambda/tau_stag default so a reward config that
@@ -132,6 +142,8 @@ class DEEnv:
             box_scale_range=cfg.get("environment.box_scale_range", None),
             f_range=cfg.get("environment.f_range", None),
             cr_range=cfg.get("environment.cr_range", None),
+            np_range=cfg.get("environment.np_range", None),
+            box_centers=cfg.get("environment.box_centers", None),
             exp_id=cfg.exp_id,
             is_smoke=cfg.is_smoke,
         )
@@ -220,6 +232,8 @@ class DEEnv:
             "prev_budget_frac": self.warmup_frac,
             "prev_sampling_box_index": None,      # warm-up used no box action
             "prev_box_scale_norm": 0.0,           # ... and no continuous scale
+            "prev_np_norm": (self.action.np_norm(self.pop_size)
+                             if self._has_np_action else 0.0),  # warm-up NP
             "current_box_width_frac": 1.0,        # it used the whole domain
         }
         obs = self.observation.build(ctx)
@@ -249,11 +263,17 @@ class DEEnv:
             box_scale = self.box_scales[int(decoded["sampling_box"])]
             prev_box_scale_norm = 0.0
 
+        # Where to place this segment's box: the agent's choice if the action
+        # space offers one (param_strategy_boxnp), else the fixed episode default.
+        box_center = decoded.get("box_center", self.box_center)
+
         # Transform the previous segment's population into this segment's box.
+        # 'random' centers draw from the episode RNG, keeping the episode
+        # reproducible for a given (seed, function).
         box = transform_box(
             self._prev_segment.final_population, box_scale, self.box_min_frac,
             self._domain_lo, self._domain_hi,
-            self.box_center, self._global_best_solution,
+            box_center, self._global_best_solution, rng=self._seed_rng,
         )
 
         fes_before = self._fes_used
@@ -266,8 +286,16 @@ class DEEnv:
         else:
             fe_budget = requested                 # run full, exhausting budget
 
+        # Population size for this segment: the agent's NP if offered, else the
+        # fixed pop_size. Clamp to fe_budget so the initial-population evaluation
+        # (which costs NP FEs regardless of generations) can never overspend the
+        # segment budget; the terminal test below (>= np_min) guarantees
+        # fe_budget >= np_min, so the clamp never drops below a workable size.
+        seg_pop_size = decoded.get("pop_size", self.pop_size)
+        seg_pop_size = min(int(seg_pop_size), fe_budget)
+
         seg = run_segment(
-            self._objective, self.dim, self.pop_size,
+            self._objective, self.dim, seg_pop_size,
             box.box_lo, box.box_hi, self._domain_lo, self._domain_hi,
             decoded["strategy"], decoded["F"], decoded["CR"],
             fe_budget, self.n_checkpoints,
@@ -303,8 +331,11 @@ class DEEnv:
         tau = seg.fes_used / (self.tau_frac * self.budget)
 
         # Budget exhaustion is a genuine terminal state (spec §6.5): done when
-        # the remainder cannot even seed another population.
-        terminated = (self.budget - self._fes_used) < self.pop_size
+        # the remainder cannot even seed another population. With a variable NP
+        # the next segment's size is not yet known, so the floor is the smallest
+        # population the agent could request (np_min == pop_size for fixed-NP
+        # spaces, so this is unchanged there).
+        terminated = (self.budget - self._fes_used) < self._np_min
         budget_remaining_frac = max(0.0,
                                     (self.budget - self._fes_used) / self.budget)
 
@@ -333,6 +364,8 @@ class DEEnv:
             "prev_budget_frac": decoded["budget_frac"],
             "prev_sampling_box_index": decoded["sampling_box"],
             "prev_box_scale_norm": prev_box_scale_norm,
+            "prev_np_norm": (self.action.np_norm(seg_pop_size)
+                             if self._has_np_action else 0.0),
             "current_box_width_frac": box_width_frac_initial,
         }
         next_obs = self.observation.build(ctx)
@@ -351,6 +384,8 @@ class DEEnv:
             "fes_used_segment": seg.fes_used,
             "fes_used_total": self._fes_used,
             "strategy": decoded["strategy"],
+            "box_center": box_center,
+            "pop_size_action": seg_pop_size,
             "F": decoded["F"],
             "CR": decoded["CR"],
             "budget_frac_action": decoded["budget_frac"],

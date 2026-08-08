@@ -40,7 +40,7 @@ class SamplingBox:
 
 
 def transform_box(final_population, scale, box_min_frac,
-                  domain_lo, domain_hi, box_center, incumbent):
+                  domain_lo, domain_hi, box_center, incumbent, rng=None):
     """Build the next segment's sampling box.
 
     final_population : (NP, D) previous segment's final population
@@ -52,9 +52,13 @@ def transform_box(final_population, scale, box_min_frac,
     box_min_frac     : collapse floor as a fraction of the domain half-width
                        (episode.box_min_frac, 1/24 ≈ 0.0417)
     domain_lo, domain_hi : (D,) true search domain, for the floor and the clip
-    box_center       : 'centroid' | 'incumbent' (episode.box_center)
+    box_center       : 'centroid' | 'incumbent' | 'random'. The first two are
+                       deterministic; 'random' places the center at a uniform
+                       point in the domain (a learned diversification / restart
+                       move) and therefore requires `rng`.
     incumbent        : (D,) best-so-far solution; the center when box_center is
                        'incumbent', and always the point tested for containment
+    rng              : a numpy Generator, required only for box_center='random'
     """
     pop = np.asarray(final_population, dtype=np.float64)
     domain_lo = np.asarray(domain_lo, dtype=np.float64)
@@ -69,9 +73,14 @@ def transform_box(final_population, scale, box_min_frac,
         center = pop.mean(axis=0)
     elif box_center == "incumbent":
         center = incumbent.copy()
+    elif box_center == "random":
+        if rng is None:
+            raise ValueError("box_center='random' requires an rng.")
+        center = domain_lo + rng.random(domain_lo.shape) * (domain_hi - domain_lo)
     else:
         raise ValueError(
-            f"box_center must be 'centroid' or 'incumbent', got {box_center!r}."
+            f"box_center must be 'centroid', 'incumbent' or 'random', "
+            f"got {box_center!r}."
         )
 
     # 3. scale the half-width by the action's factor

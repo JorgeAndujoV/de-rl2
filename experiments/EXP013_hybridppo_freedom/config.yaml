@@ -1,0 +1,113 @@
+experiment: EXP013_hybridppo_freedom
+
+# EXP013: the EXP010/012 winner (Hybrid PPO) given more control of the DE, on
+# the SAME 11 functions / budget / reward, to test whether extra freedom helps.
+# Three additions over param_strategy_continuous, all via the new
+# param_strategy_boxnp action space (agent code is UNCHANGED — only n_actions and
+# param_dim grow):
+#
+#   1. Population size NP is an agent action (a 5th continuous param, LOG-scaled
+#      over np_range) chosen PER RESTART -> learned adaptive population sizing.
+#      The warm-up NP stays fixed at episode.pop_size (50); only the agent's
+#      segments vary it. NP is clamped to the segment's FE budget by the env.
+#   2. Box center is an agent choice: centroid | incumbent | random. It is
+#      folded into the discrete head, so the Categorical is over the JOINT
+#      (strategy, box_center) = 5 * 3 = 15 actions. 'random' places the next box
+#      at a uniform domain point (a learned restart / diversification move).
+#   3. A 5th strategy, current-to-pbest/1 (JADE, archive-free), joins the menu.
+#
+# NOT changed here: the warm-up is still the fixed opener (agent-controlled
+# warm-up is a later step). The observation is traj20_contboxnp (99 dims): the
+# strategy one-hot widens to 5 and prev_NP_norm is appended so the agent sees the
+# population size it just used.
+#
+# On-policy PPO, so this is VECTORIZED exactly like EXP010 (8 SubprocVecEnv
+# workers, evaluation stays single-env greedy). Uses its OWN baseline namespace:
+# plain DE is unchanged, but the random baseline now samples the larger action
+# space (NP + box_center), so it must be regenerated rather than shared.
+
+benchmark:
+  name: cec13
+  functions: [2, 6, 11, 12, 17, 3, 7, 15, 10, 16, 22]
+  dim: 30
+  budget: 300000
+
+episode:
+  pop_size: 50                 # WARM-UP population size (fixed); agent sets NP
+  warmup_frac: 0.05            #   for every subsequent segment via np_range
+  warmup:
+    strategy: rand/1/bin
+    F: 0.5
+    CR: 0.9
+  box_center: centroid         # fallback only; the agent chooses per segment
+  box_scales: [1.0]            # unused (continuous box)
+  box_min_frac: 0.0417
+  elitism: false
+  truncate_last_segment: true
+
+environment:
+  observation: traj20_contboxnp
+  n_checkpoints: 20
+  action_space: param_strategy_boxnp
+  f_range: [0.0, 1.0]
+  cr_range: [0.0, 1.0]
+  budget_range: [0.05, 0.95]
+  box_scale_range: [0.25, 3.0]
+  np_range: [16, 400]          # LOG-scaled agent population size (warm-up = 50)
+  box_centers: [centroid, incumbent, random]
+  strategy_profiles:           # 5 strategies -> discrete head is 5 * 3 = 15
+    - {strategy: rand/1/bin}
+    - {strategy: best/1/bin}
+    - {strategy: current-to-best/1/bin}
+    - {strategy: rand/2/bin}
+    - {strategy: current-to-pbest/1/bin}
+  reward:
+    name: log_stagnation       # identical to EXP009/010/011
+    lambda: 0.1
+    tau_stag: 3
+
+agent:
+  name: hybrid_ppo
+  param_dim: 5                 # F, CR, budget_frac, box_scale, NP
+  discounting: per_budget
+  gamma: 0.99
+  gae_lambda: 0.95
+  lr: 3.0e-4
+  policy_hidden: [128, 128]
+  value_hidden: [128, 128]
+  clip: 0.2
+  epochs: 10
+  minibatch_size: 64
+  entropy_coef: 0.01
+  value_coef: 0.5
+  max_grad_norm: 0.5
+  rollout_steps: 512
+  n_envs: 8
+
+training:
+  # Dense logging from the start (learning_curve reads it directly): eval_every
+  # in PPO gradient steps, periodic_eval in episodes.
+  episodes: 10000
+  eval_every: 100
+  eval_episodes: 10
+  checkpoint_every: 2000
+  periodic_eval:
+    start: 500
+    every: 500
+
+evaluation:
+  runs_per_function: 51
+  seed_offset: 900000
+  save_trajectory_seeds: 3
+  # OWN namespace: the random baseline samples the larger (NP + box_center)
+  # action space, so it cannot share CONT_ACTION_BASELINES. Plain DE is
+  # identical but is regenerated here for a self-contained baseline set.
+  baseline_namespace: CONT_ACTION_NP_BASELINES
+  compare_against: [BASE001_de_plain, BASE003_random]
+
+slurm:
+  time: "5-00:00:00"
+  mem: "16G"
+  cpus: 8                       # matches n_envs; each worker pinned to 1 TF thread
+  gpus: 0
+  account: def-bolufe

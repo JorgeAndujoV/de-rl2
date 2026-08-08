@@ -1,0 +1,4 @@
+function_id,baseline_name,agent_mean,agent_median,baseline_mean,baseline_median,pct_diff,test_statistic,p_value
+2,BASE001_de_plain,2.736235e+05,2.284173e+05,1.957925e+05,1.745080e+05,-39.7517,257,0.000141445
+2,BASE002_fixed_schedule,2.736235e+05,2.284173e+05,2.643058e+05,2.422833e+05,-3.5253,660,0.977566
+2,BASE003_random,2.736235e+05,2.284173e+05,2.974946e+06,1.906654e+06,90.8024,0,5.14528e-10

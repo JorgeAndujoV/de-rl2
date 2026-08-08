@@ -120,7 +120,7 @@ class Stagnation:
 
 
 class LogStagnation:
-    """Log-improvement variant of Stagnation (EXP004).
+    """Log-improvement variant of Stagnation.
 
         R_t = (log10(e_{t-1}+c) − log10(e_t+c)) − λ·I[n_stag ≥ τ]·improved   (every t)
             +  (−log10(e_0+c))                                              (only t = 1)
@@ -169,7 +169,7 @@ class LogStagnation:
 
 
 class LogImprovement:
-    """Log-improvement reward WITHOUT the stagnation penalty (EXP007).
+    """Log-improvement reward WITHOUT the stagnation penalty.
 
         R_t = log10(e_{t-1}+c) − log10(e_t+c)          (every t)
             + (−log10(e_0+c))                          (only t = 1)

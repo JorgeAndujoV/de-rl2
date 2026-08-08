@@ -74,12 +74,16 @@ EPISODE_COLUMNS = ["function_id", "seed", "final_error", "n_steps",
 
 STEP_COLUMNS = ["episode_id", "function_id", "seed", "step_idx", "tau",
                 "budget_used_before", "budget_remaining_frac_before",
-                "strategy", "F", "CR", "budget_frac_action",
+                "strategy", "box_center", "pop_size_action", "F", "CR",
+                "budget_frac_action",
                 "sampling_box_action", "box_width_frac_initial",
                 "box_width_frac_final", "box_at_floor", "incumbent_in_box",
                 "n_stag_before", "n_stag_after", "segment_best_error",
                 "global_best_error_before", "global_best_error_after",
                 "reward", "done"]
+# box_center / pop_size_action are only emitted by the freedom action space
+# (param_strategy_boxnp); for every other experiment the env's info lacks them
+# and the column is written blank (see the info.get in evaluate_policy).
 
 
 def run_episode(env, seed, function_id, policy):
@@ -364,7 +368,7 @@ def evaluate_policy(cfg, env, policy, out_dir):
             for info in infos:
                 row = {"episode_id": episode_id, "function_id": fid,
                        "seed": seed}
-                row.update({k: info[k] for k in STEP_COLUMNS[3:]})
+                row.update({k: info.get(k, "") for k in STEP_COLUMNS[3:]})
                 step_rows.append(row)
             # Full within-segment trajectories only for the first N seeds of
             # each function, for figure-making (spec §8). Kept, not pruned.

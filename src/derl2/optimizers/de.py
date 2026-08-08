@@ -144,7 +144,20 @@ class _SegmentDE:
         sel = tf.where(tf.equal(sel, row), tf.tile(spare, [1, n_rand]), sel)
         idx = [sel[:, k] for k in range(n_rand)]
 
-        mutant = strategy.mutate_tf(x, idx, best, x, F)
+        # A pbest strategy needs a per-row donor drawn from the top p_best of the
+        # population. `needs_pbest` is a static Python bool (the trace is keyed on
+        # strategy_name), so this branch — and its extra RNG draw — exists ONLY
+        # for that strategy; every other strategy's draws (and thus its results)
+        # are untouched. The draw is placed here, after `perm`, so the pbest
+        # stream is self-contained.
+        if strategy.needs_pbest:
+            pbest_size = max(2, int(round(strategy.p_best * NP)))
+            top = tf.argsort(self.fitness)[:pbest_size]     # best-first indices
+            pick = self.gen.uniform((NP,), maxval=pbest_size, dtype=tf.int32)
+            pbest = tf.gather(x, tf.gather(top, pick))       # (NP, D)
+            mutant = strategy.mutate_tf(x, idx, best, x, F, pbest)
+        else:
+            mutant = strategy.mutate_tf(x, idx, best, x, F)
         mutant = tf.clip_by_value(mutant, self.lower, self.upper)
 
         # binomial crossover, one dimension forced from the mutant

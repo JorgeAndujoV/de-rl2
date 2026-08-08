@@ -198,11 +198,51 @@ class Traj20ContBox(Traj20):
         return np.concatenate([block_ab, block_c]).astype(np.float32)
 
 
+class Traj20ContBoxNP(Traj20ContBox):
+    """traj20_contbox extended for the EXP013 freedom action space
+    (param_strategy_boxnp): five strategies and an agent-chosen population size.
+
+    Two Block-C changes over the parent:
+      * the strategy one-hot (C3a) widens from 4 to N_STRATEGIES=5, to cover the
+        added current-to-pbest/1;
+      * a new scalar C3f = prev_NP_norm, the previous segment's population size
+        log-normalized to [0, 1] over the action space's np_range (the env
+        computes it via ParamStrategyBoxNP.np_norm), so the agent can see the NP
+        it just used — the analogue of prev_F / prev_CR / prev_box_scale_norm.
+
+    box_center is chosen jointly inside the discrete head and is NOT added to the
+    observation (it is a fresh per-step decision, like the strategy itself).
+
+    Block C is therefore 13 wide, so dim = 80 + 6 + 13 = 99."""
+
+    name = "traj20_contboxnp"
+    N_STRATEGIES = 5
+    dim = 4 * Traj20.K + 6 + (6 + N_STRATEGIES + 2)          # 80 + 6 + 13 = 99
+
+    def build(self, ctx):
+        block_ab = self._blocks_ab(ctx)
+
+        block_c = np.concatenate([
+            np.array([ctx["budget_remaining_frac"]], dtype=np.float32),   # C1
+            np.array([ctx["n_steps_taken"] / 19.0], dtype=np.float32),    # C2
+            _one_hot(ctx["prev_strategy_index"], self.N_STRATEGIES),      # C3a
+            np.array([ctx["prev_F"]], dtype=np.float32),                  # C3b
+            np.array([ctx["prev_CR"]], dtype=np.float32),                 # C3c
+            np.array([ctx["prev_budget_frac"]], dtype=np.float32),        # C3d
+            np.array([ctx["prev_box_scale_norm"]], dtype=np.float32),     # C3e
+            np.array([ctx["prev_np_norm"]], dtype=np.float32),            # C3f
+            np.array([ctx["current_box_width_frac"]], dtype=np.float32),  # C4
+        ]).astype(np.float32)
+
+        return np.concatenate([block_ab, block_c]).astype(np.float32)
+
+
 # --------------------------------------------------------------- registry
 
 OBSERVATIONS = {
     "traj20": Traj20,
     "traj20_contbox": Traj20ContBox,
+    "traj20_contboxnp": Traj20ContBoxNP,
 }
 
 

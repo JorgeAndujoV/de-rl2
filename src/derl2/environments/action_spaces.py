@@ -159,11 +159,111 @@ class ParamStrategyContinuous:
         return (int(rng.integers(self.n)), rng.random(self.param_dim))
 
 
+class ParamStrategyBoxNP(ParamStrategyContinuous):
+    """param_strategy_continuous extended with two new freedoms (EXP013).
+
+    On top of the {strategy, F, CR, budget_frac, box_scale} of the parent it adds:
+
+      * box_center — a discrete choice of WHERE to place the next sampling box:
+        'centroid' (previous population mean), 'incumbent' (best-so-far), or
+        'random' (a uniform domain point — a learned restart/diversification).
+        It is folded into the discrete head rather than made a separate policy
+        factor, so a plain Categorical agent needs no change: the discrete index
+        is the JOINT (strategy, box_center), n = |strategies| * |box_centers|,
+        decoded as ``strategy_idx = k // n_bc``, ``box_center_idx = k % n_bc``.
+
+      * pop_size (NP) — a 5th continuous parameter, LOG-scaled over np_range so
+        the agent controls it multiplicatively (equal resolution at NP=20 and
+        NP=200). This is per-restart adaptive population sizing; the warm-up NP
+        stays fixed (episode.pop_size), only the agent's segments vary it.
+
+    An action is still ``(k, raw_params)`` with ``k`` the joint index and
+    ``raw_params`` now length 5 ([F, CR, budget, box, NP] in [0,1]). The env
+    reads the extra ``box_center`` and ``pop_size`` keys from the decoded dict
+    (older spaces omit them, so the env falls back to its fixed values).
+    """
+
+    name = "param_strategy_boxnp"
+    PARAM_NAMES = ("F", "CR", "budget_frac", "box_scale", "pop_size")
+    continuous_box = True
+    DEFAULT_BOX_CENTERS = ("centroid", "incumbent", "random")
+
+    def __init__(self, strategy_profiles, budget_fracs=None, *,
+                 f_range=(0.0, 1.0), cr_range=(0.0, 1.0),
+                 budget_range=(0.05, 0.95), box_scale_range=(0.25, 3.0),
+                 np_range=(16, 400), box_centers=None, **_ignored):
+        # Parent sets strategies/profiles/ranges(4)/budget_min for F,CR,budget,box.
+        super().__init__(strategy_profiles, budget_fracs,
+                         f_range=f_range, cr_range=cr_range,
+                         budget_range=budget_range,
+                         box_scale_range=box_scale_range)
+        self.box_centers = list(box_centers) if box_centers is not None \
+            else list(self.DEFAULT_BOX_CENTERS)
+        self.np_min, self.np_max = int(np_range[0]), int(np_range[1])
+        if self.np_min < 2 or self.np_max <= self.np_min:
+            raise ValueError(
+                f"np_range must be increasing with np_min >= 2, got {np_range}.")
+        self._log_np_min = float(np.log(self.np_min))
+        self._log_np_max = float(np.log(self.np_max))
+        # NP is scaled separately (log, not affine), so the parent's affine
+        # `ranges` list covers only the first four params; param_dim is 5.
+        self.param_dim = len(self.PARAM_NAMES)
+        # Discrete head is the JOINT (strategy, box_center).
+        self.n = len(self.strategies) * len(self.box_centers)
+
+    def np_from_raw(self, v):
+        """Log-map a raw [0,1] value to an integer population size."""
+        v = min(max(float(v), 0.0), 1.0)
+        return int(round(np.exp(self._log_np_min
+                                + v * (self._log_np_max - self._log_np_min))))
+
+    def np_norm(self, n):
+        """Inverse of np_from_raw (up to rounding): population size -> [0,1], for
+        the observation's prev_NP feature. Uses the same log scale."""
+        n = float(min(max(n, self.np_min), self.np_max))
+        return (np.log(n) - self._log_np_min) \
+            / (self._log_np_max - self._log_np_min + 1e-12)
+
+    def decode(self, action):
+        """action = (joint_idx, raw_params[5]) -> env config dict."""
+        k, raw = action
+        k = int(k)
+        if not 0 <= k < self.n:
+            raise IndexError(
+                f"joint index {k} out of range [0,{self.n}) for {self.name}.")
+        raw = np.asarray(raw, dtype=np.float64).reshape(-1)
+        if raw.shape[0] != self.param_dim:
+            raise ValueError(
+                f"{self.name} expects {self.param_dim} params, got {raw.shape[0]}.")
+        n_bc = len(self.box_centers)
+        strategy_idx = k // n_bc
+        box_center = self.box_centers[k % n_bc]
+        # First four params affine-scaled by the parent's ranges; NP log-scaled.
+        F, CR, budget_frac, box_scale = [
+            lo + min(max(float(v), 0.0), 1.0) * (hi - lo)
+            for v, (lo, hi) in zip(raw[:4], self.ranges)
+        ]
+        return {
+            "strategy": self.strategies[strategy_idx],
+            "box_center": box_center,
+            "F": F,
+            "CR": CR,
+            "budget_frac": budget_frac,
+            "sampling_box": box_scale,        # continuous scale (continuous_box)
+            "pop_size": self.np_from_raw(raw[4]),
+        }
+
+    def sample_random(self, rng):
+        """Uniform random action: a joint index + 5 params in [0,1]."""
+        return (int(rng.integers(self.n)), rng.random(self.param_dim))
+
+
 # --------------------------------------------------------------- registry
 
 ACTION_SPACES = {
     "profiles_budget_area": ProfilesBudgetArea,
     "param_strategy_continuous": ParamStrategyContinuous,
+    "param_strategy_boxnp": ParamStrategyBoxNP,
 }
 
 

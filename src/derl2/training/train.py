@@ -335,9 +335,17 @@ def main():
                 if ts >= next_eval_at:
                     log_checkpoint(); next_eval_at += eval_every
                 if periodic_every:
-                    while (k_done + 1) * periodic_every <= completed and \
-                            (k_done + 1) * periodic_every >= periodic_start:
-                        k_done += 1
+                    # Fire at most ONE periodic eval per update. A PPO rollout
+                    # completes many episodes at once, so `completed` can jump
+                    # past several `every`-multiples in a single update; the
+                    # policy changed only once, so re-evaluating it for every
+                    # crossed multiple is pure waste (it exploded smoke runs into
+                    # ~190 checkpoints). Evaluate once, at the highest multiple
+                    # reached. In the real run a rollout never crosses two
+                    # multiples (rollout << every), so behaviour is unchanged.
+                    k_target = completed // periodic_every
+                    if k_target > k_done and completed >= periodic_start:
+                        k_done = k_target
                         periodic_checkpoint(k_done, completed)
 
                 # ---- cluster walltime safety ----

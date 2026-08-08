@@ -1,0 +1,131 @@
+{
+  "experiment": "EXP004_dqn_rewardf",
+  "mode": "train_eval",
+  "git_commit": "3fdb265eb9d974eec112cd60342cb5712d1172b4",
+  "git_dirty": true,
+  "slurm_job_id": "18989471",
+  "hostname": "c684.nibi.sharcnet",
+  "started_at": "2026-08-03T03:03:20Z",
+  "finished_at": "2026-08-04T07:20:07Z",
+  "wall_seconds": 101807,
+  "exit_status": "completed",
+  "python_version": "3.11.5",
+  "tensorflow_version": "2.19.1",
+  "numpy_version": "2.1.1",
+  "resolved_config": {
+    "experiment": "EXP004_dqn_rewardf",
+    "seed": 0,
+    "benchmark": {
+      "name": "cec13",
+      "functions": [
+        2
+      ],
+      "dim": 30,
+      "budget": 300000
+    },
+    "episode": {
+      "pop_size": 50,
+      "warmup_frac": 0.025,
+      "warmup": {
+        "strategy": "rand/1/bin",
+        "F": 0.5,
+        "CR": 0.9
+      },
+      "box_center": "centroid",
+      "box_scales": [
+        3.0,
+        1.5,
+        1.0,
+        0.5,
+        0.25
+      ],
+      "box_min_frac": 0.0417,
+      "elitism": false,
+      "truncate_last_segment": true
+    },
+    "environment": {
+      "observation": "traj20",
+      "n_checkpoints": 20,
+      "action_space": "profiles_budget_area",
+      "budget_fracs": [
+        0.025,
+        0.1,
+        0.25
+      ],
+      "strategy_profiles": [
+        {
+          "strategy": "rand/1/bin",
+          "F": 0.5,
+          "CR": 0.9
+        },
+        {
+          "strategy": "best/1/bin",
+          "F": 0.8,
+          "CR": 0.5
+        },
+        {
+          "strategy": "current-to-best/1/bin",
+          "F": 0.5,
+          "CR": 0.3
+        },
+        {
+          "strategy": "rand/2/bin",
+          "F": 0.5,
+          "CR": 0.3
+        }
+      ],
+      "reward": {
+        "name": "log_stagnation",
+        "lambda": 0.1,
+        "tau_stag": 3
+      }
+    },
+    "agent": {
+      "name": "dqn",
+      "discounting": "per_budget",
+      "gamma": 0.99,
+      "lr": 0.001,
+      "hidden": [
+        100,
+        75,
+        50
+      ],
+      "buffer_size": 100000,
+      "batch_size": 64,
+      "target_update": 500,
+      "warmup_transitions": 100,
+      "epsilon": {
+        "start": 1.0,
+        "end": 0.05,
+        "decay_steps": 40000
+      }
+    },
+    "training": {
+      "episodes": 10000,
+      "eval_every": 2000,
+      "eval_episodes": 10,
+      "checkpoint_every": 2000,
+      "periodic_eval": {
+        "start": 1000,
+        "every": 1000
+      }
+    },
+    "evaluation": {
+      "runs_per_function": 51,
+      "seed_offset": 900000,
+      "save_trajectory_seeds": 3,
+      "compare_against": [
+        "BASE001_de_plain",
+        "BASE002_fixed_schedule",
+        "BASE003_random"
+      ]
+    },
+    "slurm": {
+      "time": "5-00:00:00",
+      "mem": "16G",
+      "cpus": 4,
+      "gpus": 0,
+      "account": "def-bolufe"
+    }
+  }
+}

@@ -26,10 +26,19 @@ import tensorflow as tf
 
 
 class Strategy:
-    """Base class. Subclasses set `name`, `n_random`, and both mutate methods."""
+    """Base class. Subclasses set `name`, `n_random`, and both mutate methods.
+
+    `needs_pbest` marks strategies (current-to-pbest/1) that need a per-row
+    `pbest` donor — a random member of the top `p_best` fraction of the
+    population by fitness. The optimizer computes it (only such a strategy has
+    the fitness ranking) and passes it as an extra positional argument; the
+    default False keeps the 5-argument mutate signature for every other
+    strategy, so their calls — and their RNG draws — are unchanged."""
 
     name = None
     n_random = 0
+    needs_pbest = False
+    p_best = 0.1
 
     def mutate_np(self, pop, idx, best, target, F):
         raise NotImplementedError
@@ -118,6 +127,34 @@ class Rand2(Strategy):
                 + F * (tf.gather(pop, r4) - tf.gather(pop, r5)))
 
 
+class CurrentToPbest1(Strategy):
+    """DE/current-to-pbest/1 (JADE, archive-free):
+
+        v = x_i + F * (x_pbest - x_i) + F * (x_r1 - x_r2)
+
+    Like current-to-best/1 but the greedy attractor is a *random* member of the
+    top `p_best` fraction rather than the single global best, so the pull is
+    strong yet not all toward one point — the key JADE idea for keeping
+    diversity while exploiting. `x_pbest` is chosen per row by the optimizer
+    (needs_pbest=True) and supplied as the extra `pbest` argument. The external
+    archive of JADE is deliberately omitted for this first pbest experiment;
+    x_r1, x_r2 come from the current population only."""
+
+    name = "current-to-pbest/1"
+    n_random = 2
+    needs_pbest = True
+
+    def mutate_np(self, pop, idx, best, target, F, pbest):
+        r1, r2 = idx
+        return target + F * (pbest - target) + F * (pop[r1] - pop[r2])
+
+    def mutate_tf(self, pop, idx, best, target, F, pbest):
+        r1, r2 = idx
+        return (target
+                + F * (pbest - target)
+                + F * (tf.gather(pop, r1) - tf.gather(pop, r2)))
+
+
 # --------------------------------------------------------------- registry
 
 # This dictionary is the list of available mutation strategies. To add one:
@@ -128,6 +165,7 @@ STRATEGIES = {
     "best/1": Best1,
     "current-to-best/1": CurrentToBest1,
     "rand/2": Rand2,
+    "current-to-pbest/1": CurrentToPbest1,
 }
 
 
