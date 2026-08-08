@@ -69,6 +69,16 @@ STRATEGY_ORDER = ["rand/1/bin", "rand/2/bin", "current-to-best/1/bin", "best/1/b
 
 INK, MUTED, GRID, SURFACE = "#222222", "#666666", "#E6E6E6", "#FFFFFF"
 
+# CEC'13 reports an error below 1e-8 as exactly 0 (the optimum was effectively
+# reached). A log axis cannot place 0, which is what broke f10/f11/f17's curves
+# (they solve to the floor). Clip to this floor for DISPLAY only, and draw a
+# reference line so "the curve dropped to the floor" reads as "solved".
+_ERR_FLOOR = 1e-8
+
+
+def _floorclip(a):
+    return np.clip(np.asarray(a, dtype=float), _ERR_FLOOR, None)
+
 
 # --------------------------------------------------------------- styling
 def _style():
@@ -165,38 +175,68 @@ def plot_learning_curve(func_dir, fid, checkpoints, out_path):
         print(f"    [skip] learning_curve: no training_log.csv")
         return
     df = pd.read_csv(log_path)
-    step_k = df["training_step"] / 1000.0
+    series = _checkpoint_series(func_dir, checkpoints)
+    # training_log is written every eval_every GRADIENT steps. A one-update-per-
+    # step agent (DQN) produces a dense log (smooth step-axis curve); a batched-
+    # update agent (PPO) does few gradient steps, so its log is only a handful of
+    # rows and a step-axis line degenerates to ~2 points. Detect that and, when
+    # sparse, drive the figure from the EPISODE-indexed periodic checkpoints (the
+    # 51-seed medians are the honest, dense learning signal) instead.
+    dense = len(df) >= 8
 
     fig, axes = plt.subplots(2, 2, figsize=(11, 7))
-    fig.suptitle(f"{fname(fid)} — learning curve", fontweight="bold", y=0.99)
+    tag = "" if dense else "  (episode axis — batched-update agent, sparse step log)"
+    fig.suptitle(f"{fname(fid)} — learning curve{tag}", fontweight="bold", y=0.99)
 
-    # (a) held-out eval error, log-y, with ±std band and the 51-seed checkpoint
-    #     medians overlaid as the higher-fidelity reference.
+    # (a) optimisation error. Dense: 10-seed step eval + 51-seed checkpoint dots.
+    # Sparse: the 51-seed checkpoint median (+IQR) on the episode axis.
     ax = axes[0, 0]
-    m, s = df["mean_eval_fitness"], df["std_eval_fitness"]
-    lo = np.clip(m - s, np.nanmax([m.min() * 0.1, 1e-12]), None)
-    ax.fill_between(step_k, lo, m + s, color=OKABE[0], alpha=0.15, linewidth=0)
-    ax.plot(step_k, m, color=OKABE[0], lw=2, label="10-seed eval (±std)")
-    series = _checkpoint_series(func_dir, checkpoints)
-    if series["step"].size and np.all(np.isfinite(series["step"])):
-        ax.plot(series["step"] / 1000.0, series["med"], "o", color=OKABE[3],
-                ms=6, zorder=5, label="51-seed checkpoint median")
+    if dense:
+        x = df["training_step"] / 1000.0
+        m, sd = _floorclip(df["mean_eval_fitness"]), df["std_eval_fitness"]
+        ax.fill_between(x, _floorclip(df["mean_eval_fitness"] - sd), m + sd,
+                        color=OKABE[0], alpha=0.15, linewidth=0)
+        ax.plot(x, m, color=OKABE[0], lw=2, label="10-seed eval (±std)")
+        if series["ep"].size and np.all(np.isfinite(series["step"])):
+            ax.plot(series["step"] / 1000.0, _floorclip(series["med"]), "o",
+                    color=OKABE[3], ms=6, zorder=5, label="51-seed median")
+        xlabel = "training step (×1000)"
+    else:
+        if series["ep"].size:
+            ax.fill_between(series["ep"], _floorclip(series["q1"]),
+                            _floorclip(series["q3"]), color=OKABE[0],
+                            alpha=0.15, linewidth=0)
+            ax.plot(series["ep"], _floorclip(series["med"]), color=OKABE[0],
+                    lw=2, marker="o", ms=5, label="51-seed median (IQR)")
+        xlabel = "episode"
     ax.set_yscale("log")
     ax.set_ylabel("best error (log)")
     ax.set_title("optimisation error vs training", loc="left")
+    if series["med"].size and np.nanmin(series["med"]) <= _ERR_FLOOR:
+        ax.axhline(_ERR_FLOOR, color=OKABE[2], lw=1, ls="--",
+                   label="optimum floor (error ≤ 1e-8 = solved)")
+        ax.set_ylim(bottom=_ERR_FLOOR / 3)
     ax.legend(frameon=False, loc="upper right")
 
+    # (b,c,d) return / loss / episode length — always the raw training_log on its
+    # native gradient-step axis: dense and smooth for DQN; a few honest points
+    # (shown as markers) for a batched-update agent. We do NOT synthesise extra
+    # points — a sparse log genuinely has few, and per-checkpoint copies of it
+    # are degenerate.
+    xr = df["training_step"] / 1000.0
     for ax, col, title, color in (
         (axes[0, 1], "mean_return", "mean episode return", OKABE[2]),
         (axes[1, 0], "mean_loss", "mean TD loss", OKABE[1]),
         (axes[1, 1], "mean_episode_length", "mean episode length (restarts)",
          OKABE[4]),
     ):
-        ax.plot(step_k, df[col], color=color, lw=2)
+        ax.plot(xr, df[col].to_numpy(float), color=color, lw=2,
+                marker=("" if dense else "o"), ms=(0 if dense else 5))
         ax.set_title(title, loc="left")
-
-    for ax in axes.flat:
         ax.set_xlabel("training step (×1000)")
+
+    axes[0, 0].set_xlabel(xlabel)     # error panel: episode (sparse) or step
+    for ax in axes.flat:
         _despine(ax)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     _save(fig, out_path)
@@ -238,8 +278,16 @@ def _checkpoint_series(func_dir, checkpoints):
         else:
             q1.append(m); q3.append(m)
         tl = os.path.join(cdir, "training_log.csv")
-        step.append(int(pd.read_csv(tl)["training_step"].max())
-                    if os.path.exists(tl) else np.nan)
+        # The cumulative log can be header-only at an early periodic checkpoint
+        # (e.g. PPO, whose gradient-step count trails eval_every early on), so
+        # training_step.max() is NaN — carry it as NaN rather than crashing on
+        # int(); downstream plots already guard on np.isfinite(step).
+        ts_max = np.nan
+        if os.path.exists(tl):
+            col = pd.read_csv(tl)["training_step"]
+            if len(col) and np.isfinite(col.max()):
+                ts_max = int(col.max())
+        step.append(ts_max)
     return {k: np.array(v, dtype=float) for k, v in
             dict(ep=ep, step=step, med=med, q1=q1, q3=q3).items()}
 
@@ -258,21 +306,29 @@ def plot_learning_progress(func_dir, fid, checkpoints, out_path):
     log_path = os.path.join(func_dir, "training_log.csv")
     if os.path.exists(log_path) and np.all(np.isfinite(s["step"])):
         df = pd.read_csv(log_path)
-        anchor_step = np.concatenate([[0.0], s["step"]])
-        anchor_ep = np.concatenate([[0.0], s["ep"]])
-        ep_of_step = np.interp(df["training_step"], anchor_step, anchor_ep)
-        ax.plot(ep_of_step, df["mean_eval_fitness"], color=MUTED, lw=1,
-                alpha=0.7, label="dense 10-seed eval (per training step)")
+        if len(df):
+            anchor_step = np.concatenate([[0.0], s["step"]])
+            anchor_ep = np.concatenate([[0.0], s["ep"]])
+            ep_of_step = np.interp(df["training_step"], anchor_step, anchor_ep)
+            ax.plot(ep_of_step, _floorclip(df["mean_eval_fitness"]), color=MUTED,
+                    lw=1, alpha=0.7,
+                    label="dense 10-seed eval (per training step)")
 
-    ax.fill_between(s["ep"], s["q1"], s["q3"], color=OKABE[0], alpha=0.15,
-                    linewidth=0)
-    ax.plot(s["ep"], s["med"], color=OKABE[0], lw=2.2, marker="o", ms=7,
+    med, q1, q3 = _floorclip(s["med"]), _floorclip(s["q1"]), _floorclip(s["q3"])
+    ax.fill_between(s["ep"], q1, q3, color=OKABE[0], alpha=0.15, linewidth=0)
+    ax.plot(s["ep"], med, color=OKABE[0], lw=2.2, marker="o", ms=7,
             label="checkpoint 51-seed median (IQR band)")
     bi = int(np.argmin(s["med"]))
-    ax.plot(s["ep"][bi], s["med"][bi], marker="*", ms=18, color=OKABE[3],
+    ax.plot(s["ep"][bi], med[bi], marker="*", ms=18, color=OKABE[3],
             zorder=6, label=f"best: episode {int(s['ep'][bi])}")
 
     ax.set_yscale("log")
+    # If the agent reached the optimum floor, show the floor line so the drop to
+    # it reads as "solved" rather than falling off the axis.
+    if np.nanmin(s["med"]) <= _ERR_FLOOR:
+        ax.axhline(_ERR_FLOOR, color=OKABE[2], lw=1, ls="--",
+                   label="optimum floor (error ≤ 1e-8 = solved)")
+        ax.set_ylim(bottom=_ERR_FLOOR / 3)
     ax.set_xlabel("episode  (ONE continuous training run — checkpoints are "
                   "non-destructive snapshots)")
     ax.set_ylabel("best error (log)")
@@ -283,8 +339,148 @@ def plot_learning_progress(func_dir, fid, checkpoints, out_path):
     _save(fig, out_path)
 
 
+# ------------------------------------ continuous action-space (EXP009+) support
+# The parameterized action space (param_strategy_continuous, EXP009/010/011) makes
+# budget_frac / sampling_box continuous scales and F/CR agent-chosen, so they can
+# no longer be a categorical mix (every row is a unique float). Strategy stays a
+# discrete choice; the four continuous parameters are shown as median + IQR.
+_CONT_PARAMS = [("F", "mutation F"),
+                ("CR", "crossover CR"),
+                ("budget_frac_action", "budget fraction / segment"),
+                ("sampling_box_action", "sampling-box scale")]
+
+
+def _is_continuous_actions(func_dir):
+    """True if this experiment used the continuous parameterized action space.
+    Read from the job's resolved config; fall back to sniffing a step trace
+    (a non-integer sampling_box means the continuous space)."""
+    try:
+        with open(os.path.join(func_dir, "run_metadata.json")) as fh:
+            cfg = json.load(fh)["resolved_config"]
+        return cfg["environment"]["action_space"] == "param_strategy_continuous"
+    except Exception:
+        pass
+    ks = discover_checkpoints(func_dir)
+    if ks:
+        p = os.path.join(_chkp_dir(func_dir, ks[-1]), "step_trace.csv")
+        if os.path.exists(p):
+            box = pd.read_csv(p, usecols=["sampling_box_action"])["sampling_box_action"]
+            return bool((box.to_numpy(float) % 1 != 0).any())
+    return False
+
+
+def _cont_param_series(func_dir, checkpoints):
+    """Per-checkpoint median and IQR of each continuous parameter, pooled over all
+    seeds and steps of that checkpoint's step_trace. Also the strategy mix."""
+    cols = [c for c, _ in _CONT_PARAMS]
+    ks, all_strats = [], []
+    stats = {c: {"med": [], "q1": [], "q3": []} for c in cols}
+    strat_frac = {}
+    for k in checkpoints:
+        p = os.path.join(_chkp_dir(func_dir, k), "step_trace.csv")
+        if not os.path.exists(p):
+            continue
+        df = pd.read_csv(p, usecols=cols + ["strategy"])
+        ks.append(k)
+        strat_frac[k] = df["strategy"].value_counts(normalize=True)
+        all_strats.extend(df["strategy"].tolist())
+        for c in cols:
+            v = df[c].to_numpy(float)
+            stats[c]["med"].append(float(np.median(v)))
+            stats[c]["q1"].append(float(np.percentile(v, 25)))
+            stats[c]["q3"].append(float(np.percentile(v, 75)))
+    return ks, stats, strat_frac, all_strats
+
+
+def _plot_actions_evolution_continuous(func_dir, fid, checkpoints, out_path):
+    ks, stats, strat_frac, all_strats = _cont_param_series(func_dir, checkpoints)
+    if not ks:
+        print("    [skip] actions_evolution: no step traces")
+        return
+    fig, axes = plt.subplots(5, 1, figsize=(10, 15))
+    fig.suptitle(f"{fname(fid)} — strategy mix & chosen parameters across training",
+                 fontweight="bold", y=0.995)
+
+    ax = axes[0]                                   # strategy: categorical mix
+    cats = _ordered_categories(all_strats, "strategy")
+    cmap = _color_map(cats)
+    frac = {c: [strat_frac[k].get(c, 0.0) * 100 for k in ks] for c in cats}
+    _stacked(ax, ks, frac, cats, cmap)
+    ax.set_ylim(0, 100); ax.set_ylabel("usage (%)")
+    ax.set_title("DE strategy (discrete choice)", loc="left")
+    ax.legend(frameon=False, loc="center left", bbox_to_anchor=(1.0, 0.5),
+              title="strategy")
+    _despine(ax)
+
+    for ax, (col, title), color in zip(axes[1:], _CONT_PARAMS, OKABE[1:5]):
+        med = np.array(stats[col]["med"])
+        q1, q3 = np.array(stats[col]["q1"]), np.array(stats[col]["q3"])
+        ax.fill_between(ks, q1, q3, color=color, alpha=0.18, linewidth=0)
+        ax.plot(ks, med, color=color, lw=2, marker="o", ms=4)
+        ax.set_ylabel(title)
+        ax.set_title(f"{title} — median chosen (IQR band)", loc="left")
+        _despine(ax)
+    for ax in axes:
+        ax.set_xticks(ks)
+    axes[-1].set_xlabel("checkpoint (episode ×1000)")
+    fig.tight_layout(rect=(0, 0, 1, 0.98))
+    _save(fig, out_path)
+
+
+def _plot_actions_by_phase_continuous(func_dir, fid, mature_k, out_path):
+    p = os.path.join(_chkp_dir(func_dir, mature_k), "step_trace.csv")
+    if not os.path.exists(p):
+        print("    [skip] actions_by_phase: no mature step_trace.csv")
+        return
+    cols = [c for c, _ in _CONT_PARAMS]
+    df = pd.read_csv(p, usecols=cols + ["strategy", "step_idx"])
+    steps = sorted(df["step_idx"].unique(), key=int)
+    counts = df.groupby("step_idx").size()
+    xs = list(range(len(steps)))
+
+    fig, axes = plt.subplots(5, 1, figsize=(10, 15))
+    fig.suptitle(f"{fname(fid)} — mature policy (chkp{mature_k}) by episode phase",
+                 fontweight="bold", y=0.995)
+
+    ax = axes[0]                                   # strategy mix per phase
+    cats = _ordered_categories(df["strategy"].tolist(), "strategy")
+    cmap = _color_map(cats)
+    frac = {c: [] for c in cats}
+    for st in steps:
+        share = df[df["step_idx"] == st]["strategy"].value_counts(normalize=True)
+        for c in cats:
+            frac[c].append(share.get(c, 0.0) * 100)
+    _stacked(ax, xs, frac, cats, cmap)
+    ax.set_ylim(0, 100); ax.set_ylabel("usage (%)")
+    ax.set_title("DE strategy (discrete choice)", loc="left")
+    ax.legend(frameon=False, loc="center left", bbox_to_anchor=(1.0, 0.5),
+              title="strategy")
+    _despine(ax)
+
+    for ax, (col, title), color in zip(axes[1:], _CONT_PARAMS, OKABE[1:5]):
+        med, q1, q3 = [], [], []
+        for st in steps:
+            v = df[df["step_idx"] == st][col].to_numpy(float)
+            med.append(np.median(v)); q1.append(np.percentile(v, 25))
+            q3.append(np.percentile(v, 75))
+        ax.fill_between(xs, q1, q3, color=color, alpha=0.18, linewidth=0)
+        ax.plot(xs, med, color=color, lw=2, marker="o", ms=4)
+        ax.set_ylabel(title)
+        ax.set_title(f"{title} — median chosen (IQR band)", loc="left")
+        _despine(ax)
+    for ax in axes:
+        ax.set_xticks(xs)
+        ax.set_xticklabels([f"{s}\n(n={counts[s]})" for s in steps])
+    axes[-1].set_xlabel("segment index within episode (episode phase →)")
+    fig.tight_layout(rect=(0, 0, 1, 0.98))
+    _save(fig, out_path)
+
+
 # --------------------------------------------------- 2. action-mix evolution
 def plot_actions_evolution(func_dir, fid, checkpoints, out_path):
+    if _is_continuous_actions(func_dir):
+        return _plot_actions_evolution_continuous(func_dir, fid, checkpoints,
+                                                  out_path)
     axes_cols = ["strategy", "budget_frac_action", "sampling_box_action"]
     per_axis_counts = {a: {} for a in axes_cols}      # axis -> {chkp -> Series}
     all_vals = {a: [] for a in axes_cols}
@@ -322,6 +518,8 @@ def plot_actions_evolution(func_dir, fid, checkpoints, out_path):
 
 # ------------------------------------------- 3. mature policy, action by phase
 def plot_actions_by_phase(func_dir, fid, mature_k, out_path):
+    if _is_continuous_actions(func_dir):
+        return _plot_actions_by_phase_continuous(func_dir, fid, mature_k, out_path)
     p = os.path.join(_chkp_dir(func_dir, mature_k), "step_trace.csv")
     if not os.path.exists(p):
         print("    [skip] actions_by_phase: no mature step_trace.csv")
@@ -571,19 +769,18 @@ def main():
         os.makedirs(fdir, exist_ok=True)
         print(f"  f{fid}: chkp{first_k}..chkp{mature_k}")
 
+        # The retained figure set (per user): learning_progress, learning_curve,
+        # actions_evolution. convergence / episode_restructure / actions_by_phase
+        # were dropped. plot_* for the dropped ones remain in the module (still
+        # importable) but are no longer generated.
         plot_learning_progress(func_dir, fid, checkpoints,
                                os.path.join(fdir, "learning_progress.png"))
         plot_learning_curve(func_dir, fid, checkpoints,
                             os.path.join(fdir, "learning_curve.png"))
         plot_actions_evolution(func_dir, fid, checkpoints,
                                os.path.join(fdir, "actions_evolution.png"))
-        plot_actions_by_phase(func_dir, fid, mature_k,
-                              os.path.join(fdir, "actions_by_phase.png"))
-        plot_episode_restructure(func_dir, fid, checkpoints, mature_k,
-                                 os.path.join(fdir, "episode_restructure.png"))
-        plot_convergence(func_dir, fid, first_k, mature_k,
-                         os.path.join(fdir, "convergence.png"))
 
+    # Experiment-level summary (agent vs baselines across functions); kept.
     plot_cross_function(exp_dir, functions,
                         os.path.join(out_root, "cross_function.png"))
     print("done.")

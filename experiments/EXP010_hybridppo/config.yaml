@@ -75,13 +75,23 @@ agent:
   n_envs: 8                    # parallel DEEnv copies for collection throughput
 
 training:
+  # PPO does few gradient steps (~3.8k total for this budget), so a train-step
+  # eval cadence of 2000 logged only 2 training_log rows -> the learning_curve
+  # degenerated to ~2 points. eval_every is measured in PPO minibatch gradient
+  # steps here (on-policy path), so drop it to 100 for a dense (~37-row) log:
+  # this flips analyze_experiment onto its dense path (smooth 10-seed error line
+  # + return/loss/length step curves, the familiar 4-panel view). periodic_eval
+  # is in EPISODES and feeds the 51-seed learning_progress / actions_evolution
+  # curves; halve `every` to 500 for 20 smooth points. NOTE this is a re-run
+  # from scratch (--force), NOT a resume: a resume would splice the new dense
+  # cadence onto the old sparse portion and leave a density seam in the curves.
   episodes: 10000
-  eval_every: 2000
+  eval_every: 100
   eval_episodes: 10
   checkpoint_every: 2000
   periodic_eval:
-    start: 1000
-    every: 1000
+    start: 500
+    every: 500
 
 evaluation:
   runs_per_function: 51
