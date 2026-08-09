@@ -1,0 +1,142 @@
+{
+  "experiment": "EXP009_mpdqn",
+  "mode": "train_eval",
+  "git_commit": "7461f4d7907b5d910cd6661251c35d3d76d03211",
+  "git_dirty": true,
+  "slurm_job_id": "19288712",
+  "hostname": "c20.nibi.sharcnet",
+  "started_at": "2026-08-07T17:31:27Z",
+  "finished_at": "2026-08-08T21:17:53Z",
+  "wall_seconds": 99986,
+  "exit_status": "completed",
+  "python_version": "3.11.5",
+  "tensorflow_version": "2.19.1",
+  "numpy_version": "2.1.1",
+  "resolved_config": {
+    "experiment": "EXP009_mpdqn",
+    "seed": 0,
+    "benchmark": {
+      "name": "cec13",
+      "functions": [
+        7
+      ],
+      "dim": 30,
+      "budget": 300000
+    },
+    "episode": {
+      "pop_size": 50,
+      "warmup_frac": 0.05,
+      "warmup": {
+        "strategy": "rand/1/bin",
+        "F": 0.5,
+        "CR": 0.9
+      },
+      "box_center": "centroid",
+      "box_scales": [
+        1.0
+      ],
+      "box_min_frac": 0.0417,
+      "elitism": false,
+      "truncate_last_segment": true
+    },
+    "environment": {
+      "observation": "traj20_contbox",
+      "n_checkpoints": 20,
+      "action_space": "param_strategy_continuous",
+      "f_range": [
+        0.0,
+        1.0
+      ],
+      "cr_range": [
+        0.0,
+        1.0
+      ],
+      "budget_range": [
+        0.05,
+        0.95
+      ],
+      "box_scale_range": [
+        0.25,
+        3.0
+      ],
+      "strategy_profiles": [
+        {
+          "strategy": "rand/1/bin"
+        },
+        {
+          "strategy": "best/1/bin"
+        },
+        {
+          "strategy": "current-to-best/1/bin"
+        },
+        {
+          "strategy": "rand/2/bin"
+        }
+      ],
+      "reward": {
+        "name": "log_stagnation",
+        "lambda": 0.1,
+        "tau_stag": 3
+      }
+    },
+    "agent": {
+      "name": "mpdqn",
+      "param_dim": 4,
+      "discounting": "per_budget",
+      "gamma": 0.99,
+      "lr": 0.001,
+      "actor_hidden": [
+        128,
+        128
+      ],
+      "critic_hidden": [
+        128,
+        128
+      ],
+      "buffer_size": 100000,
+      "batch_size": 64,
+      "target_update": 500,
+      "warmup_transitions": 100,
+      "grad_clip_norm": 10.0,
+      "double_q": true,
+      "target_smooth_std": 0.1,
+      "epsilon": {
+        "start": 1.0,
+        "end": 0.05,
+        "decay_steps": 40000
+      },
+      "param_noise": {
+        "start": 0.3,
+        "end": 0.05,
+        "decay_steps": 40000
+      }
+    },
+    "training": {
+      "episodes": 10000,
+      "eval_every": 2000,
+      "eval_episodes": 10,
+      "checkpoint_every": 2000,
+      "periodic_eval": {
+        "start": 1000,
+        "every": 1000
+      }
+    },
+    "evaluation": {
+      "runs_per_function": 51,
+      "seed_offset": 900000,
+      "save_trajectory_seeds": 3,
+      "baseline_namespace": "CONT_ACTION_BASELINES",
+      "compare_against": [
+        "BASE001_de_plain",
+        "BASE003_random"
+      ]
+    },
+    "slurm": {
+      "time": "5-00:00:00",
+      "mem": "16G",
+      "cpus": 4,
+      "gpus": 0,
+      "account": "def-bolufe"
+    }
+  }
+}

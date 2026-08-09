@@ -1,4 +1,5 @@
 experiment: EXP013_hybridppo_freedom
+seed: 0
 
 # EXP013: the EXP010/012 winner (Hybrid PPO) given more control of the DE, on
 # the SAME 11 functions / budget / reward, to test whether extra freedom helps.
