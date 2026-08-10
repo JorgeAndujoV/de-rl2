@@ -86,24 +86,29 @@ agent:
   n_envs: 8
 
 training:
-  # Dense logging from the start (learning_curve reads it directly): eval_every
-  # in PPO gradient steps, periodic_eval in episodes.
+  # Standard cadence: 10 periodic checkpoints (one per 1000 episodes over the
+  # 10k run), each with its full 51-seed evaluation, exactly like EXP009-011.
+  # Dense training/reward curves come from progress_log.csv (per-update rollout
+  # stats, written for free during collection), NOT from more frequent
+  # evaluation -- so evaluation and checkpoints are untouched.
   episodes: 10000
-  eval_every: 100
+  eval_every: 2000
   eval_episodes: 10
   checkpoint_every: 2000
   periodic_eval:
-    start: 500
-    every: 500
+    start: 1000
+    every: 1000
 
 evaluation:
   runs_per_function: 51
   seed_offset: 900000
   save_trajectory_seeds: 3
-  # OWN namespace: the random baseline samples the larger (NP + box_center)
-  # action space, so it cannot share CONT_ACTION_BASELINES. Plain DE is
-  # identical but is regenerated here for a self-contained baseline set.
-  baseline_namespace: CONT_ACTION_NP_BASELINES
+  # Independent baselines: no baseline_namespace, so they default to this
+  # experiment's id (baselines/EXP013_hybridppo_freedom/f<N>/). The random
+  # baseline samples the larger (NP + box_center) action space, so it must be
+  # this experiment's own; plain DE is regenerated too for a self-contained set.
+  # (baselines/ is gitignored and separate from experiments/, so retrieving
+  # results never drags baselines into the local tree.)
   compare_against: [BASE001_de_plain, BASE003_random]
 
 slurm:

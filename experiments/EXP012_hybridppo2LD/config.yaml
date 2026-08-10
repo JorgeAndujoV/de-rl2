@@ -1,4 +1,5 @@
 experiment: EXP012_hybridppo2LD
+seed: 0
 
 # EXP012: byte-for-byte the same experiment as EXP010 (Hybrid PPO on the
 # param_strategy_continuous action space), re-run ONLY to record a denser

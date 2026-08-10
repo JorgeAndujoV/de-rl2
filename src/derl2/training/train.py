@@ -169,6 +169,21 @@ def main():
                          "std_return", "mean_loss", "mean_eval_fitness",
                          "std_eval_fitness", "mean_episode_length"])
 
+    # progress_log.csv: a lightweight DENSE record of the free per-update rollout
+    # statistics (return, loss, episode length). It runs NO evaluation and touches
+    # NO checkpoint -- it only writes numbers training already computed -- so it
+    # yields smooth training/reward curves at zero cost while leaving evaluation
+    # and the checkpoint cadence byte-identical. Written once per PPO update (the
+    # on-policy loop); the off-policy loop leaves it header-only for now.
+    progress_path = os.path.join(out_dir, "progress_log.csv")
+    progress_new = not os.path.exists(progress_path)
+    progress_file = open(progress_path, "a", newline="")
+    progress_logger = csv.writer(progress_file)
+    if progress_new:
+        progress_logger.writerow(["training_step", "episode", "mean_return",
+                                  "mean_loss", "mean_episode_length"])
+        progress_file.flush()
+
     episodes = cfg.get("training.episodes")
     eval_every = cfg.get("training.eval_every")
     eval_episodes = cfg.get("training.eval_episodes")
@@ -222,6 +237,9 @@ def main():
                 os.makedirs(final_dir, exist_ok=True)
                 shutil.copyfile(log_path,
                                 os.path.join(final_dir, "training_log.csv"))
+                if os.path.exists(progress_path):
+                    shutil.copyfile(progress_path,
+                                    os.path.join(final_dir, "progress_log.csv"))
                 print(f"  chkp{k}: results persisted to {final_dir}", flush=True)
         except Exception as err:      # never lose training progress to an eval
             print(f"WARNING: periodic evaluation at episode {n_ep} (chkp{k}) "
@@ -286,6 +304,7 @@ def main():
             while completed < episodes:
                 # ---- collect: per_env steps from each of n_envs streams ----
                 streams = [[] for _ in range(n_envs)]
+                roll_returns, roll_lengths = [], []   # this rollout only (dense log)
                 for _t in range(per_env):
                     acts, logps, vals = [], [], []
                     for i in range(n_envs):
@@ -300,6 +319,8 @@ def main():
                         ep_ret[i] += float(rewards[i]); ep_len[i] += 1
                         if dones[i] > 0.5:
                             returns.append(ep_ret[i]); lengths.append(ep_len[i])
+                            roll_returns.append(ep_ret[i])
+                            roll_lengths.append(ep_len[i])
                             ep_ret[i] = 0.0; ep_len[i] = 0
                             completed += 1
                     obs = next_obs
@@ -328,6 +349,14 @@ def main():
                 losses.append(loss)
                 episode_var.assign(completed)
 
+                # Dense per-update progress row (free stats; no eval, no ckpt).
+                progress_logger.writerow([
+                    int(agent.train_steps.numpy()), completed,
+                    f"{np.mean(roll_returns):.6f}" if roll_returns else "nan",
+                    f"{float(loss):.6f}",
+                    f"{np.mean(roll_lengths):.4f}" if roll_lengths else "nan"])
+                progress_file.flush()
+
                 # ---- cadence: eval/ckpt on train steps, periodic on episodes ----
                 ts = int(agent.train_steps.numpy())
                 if ts >= next_ckpt_at:
@@ -351,7 +380,7 @@ def main():
                 # ---- cluster walltime safety ----
                 if args.max_hours and (time.perf_counter() - t_start) / 3600.0 \
                         > args.max_hours:
-                    manager.save(); venv.close(); log_file.close()
+                    manager.save(); venv.close(); log_file.close(); progress_file.close()
                     print(f"Walltime limit reached at episode {completed}; "
                           f"checkpointed. Re-run the same command to resume.")
                     sys.exit(42)
@@ -362,7 +391,7 @@ def main():
             log_checkpoint()
         manager.save()
         final_manager.save()
-        log_file.close()
+        log_file.close(); progress_file.close()
         print(f"Training finished. Output in {out_dir}")
 
     if on_policy:
@@ -411,7 +440,7 @@ def main():
         if args.max_hours and (time.perf_counter() - t_start) / 3600.0 > args.max_hours:
             manager.save()
             buffer.save(buffer_path)
-            log_file.close()
+            log_file.close(); progress_file.close()
             print(f"Walltime limit reached at episode {episode + 1}; "
                   f"checkpointed. Re-run the same command to resume.")
             # Exit 42 signals a clean walltime stop (not completion) to
@@ -426,7 +455,7 @@ def main():
     manager.save()
     buffer.save(buffer_path)       # final buffer: retained for extending later
     final_manager.save()           # the retained end-state (checkpoints/final/)
-    log_file.close()
+    log_file.close(); progress_file.close()
     print(f"Training finished. Output in {out_dir}")
 
 
