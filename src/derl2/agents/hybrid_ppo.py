@@ -186,6 +186,15 @@ class HybridPPOAgent:
         variables = (self.policy_net.trainable_variables
                      + self.value_net.trainable_variables)
         grads = tape.gradient(loss, variables)
+        # Divergence guard: on an ill-conditioned function (e.g. f3, whose 1e6
+        # conditioning overflows float32 and enters the observation/returns as
+        # extreme values) a step can produce non-finite gradients that blow the
+        # policy up to NaN -> a later rng.choice on NaN probabilities crashes the
+        # job. Replace any non-finite gradient with zero so the weights can never
+        # become NaN. This is a no-op whenever gradients are finite, so behaviour
+        # on well-conditioned functions is unchanged.
+        grads = [tf.where(tf.math.is_finite(g), g, tf.zeros_like(g))
+                 for g in grads]
         grads, _ = tf.clip_by_global_norm(grads, self.max_grad_norm)
         self.optimizer.apply_gradients(zip(grads, variables))
         return loss

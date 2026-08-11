@@ -60,7 +60,7 @@ class _SegmentDE:
     """
 
     def __init__(self, objective, dim, pop_size, box_lo, box_hi,
-                 domain_lo, domain_hi, strategy, seed):
+                 domain_lo, domain_hi, strategy, seed, cov=None):
         self.objective = objective
         self.dim = dim
         self.pop_size = pop_size
@@ -70,6 +70,13 @@ class _SegmentDE:
         # Initial sampling is confined to the box.
         self.box_lo = tf.constant(box_lo, dtype=tf.float32)
         self.box_hi = tf.constant(box_hi, dtype=tf.float32)
+        # A covariance box (center, scaled Cholesky) draws the initial population
+        # from a Gaussian ellipsoid instead of uniformly in [box_lo, box_hi].
+        self.cov = None
+        if cov is not None:
+            center, chol = cov
+            self.cov = (tf.constant(center, dtype=tf.float32),
+                        tf.constant(chol, dtype=tf.float32))
         self.strategy = build_strategy(strategy)
 
         self._default_strategy_name = strategy
@@ -111,10 +118,17 @@ class _SegmentDE:
         to the validated behaviour (see module docstring)."""
         if seed is not None:
             self.gen.reset_from_seed(seed)
-        init = self.gen.uniform(
-            (self.pop_size, self.dim),
-            minval=self.box_lo, maxval=self.box_hi, dtype=tf.float32,
-        )
+        if self.cov is None:
+            init = self.gen.uniform(
+                (self.pop_size, self.dim),
+                minval=self.box_lo, maxval=self.box_hi, dtype=tf.float32,
+            )
+        else:
+            # x = center + z @ chol.T,  z ~ N(0, I); clip to the search domain.
+            center, chol = self.cov
+            z = self.gen.normal((self.pop_size, self.dim), dtype=tf.float32)
+            init = center[None, :] + tf.matmul(z, chol, transpose_b=True)
+            init = tf.clip_by_value(init, self.lower, self.upper)
         self.population.assign(init)
         self.fitness.assign(self.objective(init))
         self.evals = self.pop_size
@@ -217,7 +231,7 @@ class _SegmentDE:
 
 
 def run_segment(objective, dim, pop_size, box_lo, box_hi, domain_lo, domain_hi,
-                strategy, F, CR, fe_budget, n_checkpoints, seed):
+                strategy, F, CR, fe_budget, n_checkpoints, seed, cov=None):
     """Run one DE segment and return a SegmentResult.
 
     The initial population evaluation costs `pop_size` FEs and each generation
@@ -232,7 +246,7 @@ def run_segment(objective, dim, pop_size, box_lo, box_hi, domain_lo, domain_hi,
     domain_width = domain_hi - domain_lo
 
     de = _SegmentDE(objective, dim, pop_size, box_lo, box_hi,
-                    domain_lo, domain_hi, strategy, seed)
+                    domain_lo, domain_hi, strategy, seed, cov=cov)
 
     def box_width_frac():
         pop = de.population.numpy()

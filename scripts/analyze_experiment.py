@@ -164,6 +164,7 @@ def _stacked(ax, x, frac_by_cat, categories, cmap, width=0.8):
 
 # --------------------------------------------------------------- axis labels
 _AXIS_TITLE = {"strategy": "DE strategy",
+               "box_center": "sampling-box centre",
                "budget_frac_action": "budget fraction / segment",
                "sampling_box_action": "sampling box"}
 
@@ -176,16 +177,22 @@ def plot_learning_curve(func_dir, fid, checkpoints, out_path):
         return
     df = pd.read_csv(log_path)
     series = _checkpoint_series(func_dir, checkpoints)
-    # training_log is written every eval_every GRADIENT steps. A one-update-per-
-    # step agent (DQN) produces a dense log (smooth step-axis curve); a batched-
-    # update agent (PPO) does few gradient steps, so its log is only a handful of
-    # rows and a step-axis line degenerates to ~2 points. Detect that and, when
-    # sparse, drive the figure from the EPISODE-indexed periodic checkpoints (the
-    # 51-seed medians are the honest, dense learning signal) instead.
-    dense = len(df) >= 8
+    # Return/loss/length source. An on-policy PPO run writes progress_log.csv --
+    # one row PER UPDATE, dense and free (no evaluation) -- so prefer it; the
+    # sparse training_log (a few eval rows) would degenerate to ~2 points. DQN
+    # has no progress_log but a dense training_log (one row per gradient-step
+    # eval), so it keeps the step-axis view. The error panel is driven by the
+    # EPISODE-indexed 51-seed periodic checkpoints whenever the step log is sparse.
+    prog_path = os.path.join(func_dir, "progress_log.csv")
+    prog = pd.read_csv(prog_path) if os.path.exists(prog_path) else None
+    use_prog = prog is not None and len(prog) >= 2
+    dense = (not use_prog) and len(df) >= 8
 
     fig, axes = plt.subplots(2, 2, figsize=(11, 7))
-    tag = "" if dense else "  (episode axis — batched-update agent, sparse step log)"
+    tag = ("" if dense else
+           "  (return/loss/length: dense per-update log; error: 51-seed evals)"
+           if use_prog else
+           "  (episode axis — batched-update agent, sparse step log)")
     fig.suptitle(f"{fname(fid)} — learning curve{tag}", fontweight="bold", y=0.99)
 
     # (a) optimisation error. Dense: 10-seed step eval + 51-seed checkpoint dots.
@@ -218,22 +225,25 @@ def plot_learning_curve(func_dir, fid, checkpoints, out_path):
         ax.set_ylim(bottom=_ERR_FLOOR / 3)
     ax.legend(frameon=False, loc="upper right")
 
-    # (b,c,d) return / loss / episode length — always the raw training_log on its
-    # native gradient-step axis: dense and smooth for DQN; a few honest points
-    # (shown as markers) for a batched-update agent. We do NOT synthesise extra
-    # points — a sparse log genuinely has few, and per-checkpoint copies of it
-    # are degenerate.
-    xr = df["training_step"] / 1000.0
+    # (b,c,d) return / loss / episode length. PPO: the DENSE per-update
+    # progress_log on the EPISODE axis (smooth). DQN: the dense training_log on
+    # its gradient-step axis. Sparse fallback: training_log points as markers.
+    if use_prog:
+        src, xr = prog, prog["episode"].to_numpy(float)
+        xlab, mk = "episode", ""
+    else:
+        src, xr = df, df["training_step"].to_numpy(float) / 1000.0
+        xlab, mk = "training step (×1000)", ("" if dense else "o")
     for ax, col, title, color in (
         (axes[0, 1], "mean_return", "mean episode return", OKABE[2]),
-        (axes[1, 0], "mean_loss", "mean TD loss", OKABE[1]),
+        (axes[1, 0], "mean_loss", "mean loss", OKABE[1]),
         (axes[1, 1], "mean_episode_length", "mean episode length (restarts)",
          OKABE[4]),
     ):
-        ax.plot(xr, df[col].to_numpy(float), color=color, lw=2,
-                marker=("" if dense else "o"), ms=(0 if dense else 5))
+        ax.plot(xr, src[col].to_numpy(float), color=color, lw=2,
+                marker=mk, ms=(0 if mk == "" else 5))
         ax.set_title(title, loc="left")
-        ax.set_xlabel("training step (×1000)")
+        ax.set_xlabel(xlab)
 
     axes[0, 0].set_xlabel(xlabel)     # error panel: episode (sparse) or step
     for ax in axes.flat:
@@ -350,16 +360,22 @@ _CONT_PARAMS = [("F", "mutation F"),
                 ("sampling_box_action", "sampling-box scale")]
 
 
-def _is_continuous_actions(func_dir):
-    """True if this experiment used the continuous parameterized action space.
-    Read from the job's resolved config; fall back to sniffing a step trace
-    (a non-integer sampling_box means the continuous space)."""
+def _action_space(func_dir):
+    """environment.action_space from the job's resolved config, or None."""
     try:
         with open(os.path.join(func_dir, "run_metadata.json")) as fh:
-            cfg = json.load(fh)["resolved_config"]
-        return cfg["environment"]["action_space"] == "param_strategy_continuous"
+            return json.load(fh)["resolved_config"]["environment"]["action_space"]
     except Exception:
-        pass
+        return None
+
+
+def _is_continuous_actions(func_dir):
+    """True if this experiment used a continuous parameterized action space
+    (param_strategy_continuous or param_strategy_boxnp). Falls back to sniffing a
+    step trace (a non-integer sampling_box means a continuous box scale)."""
+    sp = _action_space(func_dir)
+    if sp is not None:
+        return sp in ("param_strategy_continuous", "param_strategy_boxnp")
     ks = discover_checkpoints(func_dir)
     if ks:
         p = os.path.join(_chkp_dir(func_dir, ks[-1]), "step_trace.csv")
@@ -370,49 +386,66 @@ def _is_continuous_actions(func_dir):
 
 
 def _cont_param_series(func_dir, checkpoints):
-    """Per-checkpoint median and IQR of each continuous parameter, pooled over all
-    seeds and steps of that checkpoint's step_trace. Also the strategy mix."""
-    cols = [c for c, _ in _CONT_PARAMS]
-    ks, all_strats = [], []
+    """Per-checkpoint median/IQR of each continuous parameter, and the mix of each
+    DISCRETE choice, pooled over all seeds/steps of a checkpoint's step_trace. The
+    boxnp action space adds the NP parameter and the box_center choice.
+
+    Returns (ks, params, stats, disc, mix, all_disc): params is the [(col,title)]
+    list actually present; disc is the discrete axes ('strategy' [, 'box_center'])."""
+    boxnp = _action_space(func_dir) == "param_strategy_boxnp"
+    params = list(_CONT_PARAMS)
+    if boxnp:
+        params = params + [("pop_size_action", "population size NP")]
+    disc = ["strategy"] + (["box_center"] if boxnp else [])
+    cols = [c for c, _ in params]
+    ks = []
     stats = {c: {"med": [], "q1": [], "q3": []} for c in cols}
-    strat_frac = {}
+    mix = {d: {} for d in disc}
+    all_disc = {d: [] for d in disc}
     for k in checkpoints:
         p = os.path.join(_chkp_dir(func_dir, k), "step_trace.csv")
         if not os.path.exists(p):
             continue
-        df = pd.read_csv(p, usecols=cols + ["strategy"])
+        df = pd.read_csv(p, usecols=cols + disc)
         ks.append(k)
-        strat_frac[k] = df["strategy"].value_counts(normalize=True)
-        all_strats.extend(df["strategy"].tolist())
+        for d in disc:
+            mix[d][k] = df[d].value_counts(normalize=True)
+            all_disc[d].extend(df[d].astype(str).tolist())
         for c in cols:
             v = df[c].to_numpy(float)
             stats[c]["med"].append(float(np.median(v)))
             stats[c]["q1"].append(float(np.percentile(v, 25)))
             stats[c]["q3"].append(float(np.percentile(v, 75)))
-    return ks, stats, strat_frac, all_strats
+    return ks, params, stats, disc, mix, all_disc
 
 
 def _plot_actions_evolution_continuous(func_dir, fid, checkpoints, out_path):
-    ks, stats, strat_frac, all_strats = _cont_param_series(func_dir, checkpoints)
+    ks, params, stats, disc, mix, all_disc = _cont_param_series(func_dir,
+                                                                checkpoints)
     if not ks:
         print("    [skip] actions_evolution: no step traces")
         return
-    fig, axes = plt.subplots(5, 1, figsize=(10, 15))
-    fig.suptitle(f"{fname(fid)} — strategy mix & chosen parameters across training",
-                 fontweight="bold", y=0.995)
-
-    ax = axes[0]                                   # strategy: categorical mix
-    cats = _ordered_categories(all_strats, "strategy")
-    cmap = _color_map(cats)
-    frac = {c: [strat_frac[k].get(c, 0.0) * 100 for k in ks] for c in cats}
-    _stacked(ax, ks, frac, cats, cmap)
-    ax.set_ylim(0, 100); ax.set_ylabel("usage (%)")
-    ax.set_title("DE strategy (discrete choice)", loc="left")
-    ax.legend(frameon=False, loc="center left", bbox_to_anchor=(1.0, 0.5),
-              title="strategy")
-    _despine(ax)
-
-    for ax, (col, title), color in zip(axes[1:], _CONT_PARAMS, OKABE[1:5]):
+    n = len(disc) + len(params)
+    fig, axes = plt.subplots(n, 1, figsize=(10, 3 * n))
+    if n == 1:
+        axes = [axes]
+    fig.suptitle(f"{fname(fid)} — discrete choices & chosen parameters across "
+                 f"training", fontweight="bold", y=0.995)
+    ai = 0
+    for d in disc:                                 # strategy [, box_center]
+        ax = axes[ai]; ai += 1
+        cats = _ordered_categories(all_disc[d], d)
+        cmap = _color_map(cats)
+        frac = {c: [mix[d][k].get(c, 0.0) * 100 for k in ks] for c in cats}
+        _stacked(ax, ks, frac, cats, cmap)
+        ax.set_ylim(0, 100); ax.set_ylabel("usage (%)")
+        ax.set_title(f"{_AXIS_TITLE.get(d, d)} (discrete choice)", loc="left")
+        ax.legend(frameon=False, loc="center left", bbox_to_anchor=(1.0, 0.5),
+                  title=d)
+        _despine(ax)
+    for j, (col, title) in enumerate(params):      # F, CR, budget, box [, NP]
+        ax = axes[ai]; ai += 1
+        color = OKABE[1 + j % (len(OKABE) - 1)]
         med = np.array(stats[col]["med"])
         q1, q3 = np.array(stats[col]["q1"]), np.array(stats[col]["q3"])
         ax.fill_between(ks, q1, q3, color=color, alpha=0.18, linewidth=0)

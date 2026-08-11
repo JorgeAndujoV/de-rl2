@@ -106,23 +106,34 @@ def _lambda_diag(dim, alpha):
 
 
 def _t_osz_np(x):
-    """T_osz: smooth local irregularities. Report section 1.1."""
+    """T_osz oscillation. The official CEC'13 oszfunc transforms ONLY the first
+    and last coordinate (`if (i==0||i==nx-1)`); every other coordinate passes
+    through unchanged."""
     sign = np.sign(x)
     nz = x != 0
     x_hat = np.zeros_like(x)
     x_hat[nz] = np.log(np.abs(x[nz]))
     c1 = np.where(x > 0, 10.0, 5.5)
     c2 = np.where(x > 0, 7.9, 3.1)
-    return sign * np.exp(x_hat + 0.049 * (np.sin(c1 * x_hat)
-                                          + np.sin(c2 * x_hat)))
+    t = sign * np.exp(x_hat + 0.049 * (np.sin(c1 * x_hat)
+                                       + np.sin(c2 * x_hat)))
+    out = np.array(x, dtype=np.float64, copy=True)
+    out[..., 0] = t[..., 0]
+    out[..., -1] = t[..., -1]
+    return out
 
 
-def _t_asy_np(x, beta):
-    """T_asy^beta: symmetry breaking, applied only where x > 0."""
+def _t_asy_np(x, beta, fallback=None):
+    """T_asy^beta: applied where x > 0. `fallback` supplies the value used where
+    x <= 0. The official asyfunc writes only the x>0 entries and leaves the rest
+    at whatever the buffer already held; for the Rastrigins that buffer is the
+    PRE-osz value, so those call sites pass it explicitly. Default (None) keeps
+    x itself, which matches every non-osz call (f3, f7-9, f20)."""
     dim = x.shape[-1]
     i = np.arange(dim, dtype=np.float64)
     expo = 1.0 + beta * (i / (dim - 1)) * np.sqrt(np.abs(x))
-    return np.where(x > 0, np.abs(x) ** expo, x)
+    fb = x if fallback is None else fallback
+    return np.where(x > 0, np.abs(x) ** expo, fb)
 
 
 def _t_osz_tf(x):
@@ -132,15 +143,22 @@ def _t_osz_tf(x):
     x_hat = tf.where(nz, tf.math.log(safe), tf.zeros_like(x))
     c1 = tf.where(x > 0.0, 10.0, 5.5)
     c2 = tf.where(x > 0.0, 7.9, 3.1)
-    return sign * tf.exp(x_hat + 0.049 * (tf.sin(c1 * x_hat)
-                                          + tf.sin(c2 * x_hat)))
+    t = sign * tf.exp(x_hat + 0.049 * (tf.sin(c1 * x_hat)
+                                       + tf.sin(c2 * x_hat)))
+    d = x.shape[-1]
+    m = np.zeros(d, dtype=np.float32)
+    m[0] = 1.0
+    m[-1] = 1.0                       # first & last only, like the C oszfunc
+    mask = tf.constant(m, x.dtype)
+    return mask * t + (1.0 - mask) * x
 
 
-def _t_asy_tf(x, beta):
+def _t_asy_tf(x, beta, fallback=None):
     dim = x.shape[-1]
     i = tf.range(dim, dtype=x.dtype)
     expo = 1.0 + beta * (i / (dim - 1.0)) * tf.sqrt(tf.abs(x))
-    return tf.where(x > 0.0, tf.pow(tf.abs(x), expo), x)
+    fb = x if fallback is None else fallback
+    return tf.where(x > 0.0, tf.pow(tf.abs(x), expo), fb)
 
 
 # ------------------------------------------------------------ base functions
@@ -165,7 +183,8 @@ def _discus_np(z):
 
 def _different_powers_np(z):
     d = z.shape[-1]
-    e = 2.0 + 4.0 * np.arange(d, dtype=np.float64) / (d - 1)
+    # C: pow(fabs(z), 2 + 4*i/(nx-1)) with INTEGER division -> a stepped exponent.
+    e = (2.0 + (4 * np.arange(d)) // (d - 1)).astype(np.float64)
     return np.sqrt(np.sum(np.abs(z) ** e, axis=-1))
 
 
@@ -269,7 +288,8 @@ def _discus_tf(z):
 
 def _different_powers_tf(z):
     d = z.shape[-1]
-    e = tf.constant(2.0 + 4.0 * np.arange(d) / (d - 1), z.dtype)
+    e = tf.constant((2.0 + (4 * np.arange(d)) // (d - 1)).astype(np.float64),
+                    z.dtype)
     return tf.sqrt(tf.reduce_sum(tf.abs(z) ** e, axis=-1))
 
 
@@ -416,10 +436,11 @@ def _z_builders(func_no, dim, shift_block=0, rot_base=0, force_rotate=False):
 
     if n == 3:                                          # Bent Cigar
         M1, M1t = rot(0)
-        M2, M2t = rot(1)
-        return (lambda x: _t_asy_np((x - o) @ M1.T, 0.5) @ M2.T,
+        M2, M2t = rot(1)                                # asy fallback = pre-rotate
+        return (lambda x: _t_asy_np((x - o) @ M1.T, 0.5, fallback=x - o) @ M2.T,
                 lambda x: tf.matmul(
-                    _t_asy_tf(tf.matmul(x - o_tf, M1t, transpose_b=True), 0.5),
+                    _t_asy_tf(tf.matmul(x - o_tf, M1t, transpose_b=True), 0.5,
+                              fallback=x - o_tf),
                     M2t, transpose_b=True))
 
     if n == 6:                                          # Rosenbrock
@@ -430,20 +451,25 @@ def _z_builders(func_no, dim, shift_block=0, rot_base=0, force_rotate=False):
 
     if n in (7, 8):                                     # Schaffer F7 / Ackley
         M1, M1t = rot(0)
-        M2, M2t = rot(1)
-        return (lambda x: lam10 * (_t_asy_np((x - o) @ M1.T, 0.5) @ M2.T),
-                lambda x: lam10_tf * tf.matmul(
-                    _t_asy_tf(tf.matmul(x - o_tf, M1t, transpose_b=True), 0.5),
+        M2, M2t = rot(1)                                # C: asy -> lambda -> M2
+        return (lambda x: (lam10 * _t_asy_np((x - o) @ M1.T, 0.5,
+                                             fallback=x - o)) @ M2.T,
+                lambda x: tf.matmul(
+                    lam10_tf * _t_asy_tf(
+                        tf.matmul(x - o_tf, M1t, transpose_b=True), 0.5,
+                        fallback=x - o_tf),
                     M2t, transpose_b=True))
 
     if n == 9:                                          # Weierstrass
         M1, M1t = rot(0)
-        M2, M2t = rot(1)
-        return (lambda x: lam10 * (_t_asy_np(
-                    (0.5 * (x - o) / 100.0) @ M1.T, 0.5) @ M2.T),
-                lambda x: lam10_tf * tf.matmul(
-                    _t_asy_tf(tf.matmul(0.5 * (x - o_tf) / 100.0, M1t,
-                                        transpose_b=True), 0.5),
+        M2, M2t = rot(1)                                # C: asy -> lambda -> M2
+        return (lambda x: (lam10 * _t_asy_np(
+                    (0.5 * (x - o) / 100.0) @ M1.T, 0.5,
+                    fallback=0.5 * (x - o) / 100.0)) @ M2.T,
+                lambda x: tf.matmul(lam10_tf * _t_asy_tf(
+                    tf.matmul(0.5 * (x - o_tf) / 100.0, M1t,
+                              transpose_b=True), 0.5,
+                    fallback=0.5 * (x - o_tf) / 100.0),
                     M2t, transpose_b=True))
 
     if n == 10:                                         # Griewank
@@ -453,23 +479,30 @@ def _z_builders(func_no, dim, shift_block=0, rot_base=0, force_rotate=False):
                                                 M1t, transpose_b=True))
 
     if n == 11:                                         # Rastrigin, separable
-        return (lambda x: lam10 * _t_asy_np(
-                    _t_osz_np(5.12 * (x - o) / 100.0), 0.2),
-                lambda x: lam10_tf * _t_asy_tf(
-                    _t_osz_tf(5.12 * (x - o_tf) / 100.0), 0.2))
+        # C: osz(w) then asy, whose x<=0 entries fall back to the PRE-osz w.
+        def z_np(x):
+            w = 5.12 * (x - o) / 100.0
+            return lam10 * _t_asy_np(_t_osz_np(w), 0.2, fallback=w)
+
+        def z_tf(x):
+            w = 5.12 * (x - o_tf) / 100.0
+            return lam10_tf * _t_asy_tf(_t_osz_tf(w), 0.2, fallback=w)
+
+        return z_np, z_tf
 
     if n == 12:                                         # Rotated Rastrigin
         M1, M1t = rot(0)
         M2, M2t = rot(1)
 
         def z_np(x):
-            y = _t_osz_np((5.12 * (x - o) / 100.0) @ M1.T)
-            return (lam10 * (_t_asy_np(y, 0.2) @ M2.T)) @ M1.T
+            a = (5.12 * (x - o) / 100.0) @ M1.T
+            y = _t_asy_np(_t_osz_np(a), 0.2, fallback=a)   # fallback = pre-osz
+            return (lam10 * (y @ M2.T)) @ M1.T
 
         def z_tf(x):
-            y = _t_osz_tf(tf.matmul(5.12 * (x - o_tf) / 100.0, M1t,
-                                    transpose_b=True))
-            w = lam10_tf * tf.matmul(_t_asy_tf(y, 0.2), M2t, transpose_b=True)
+            a = tf.matmul(5.12 * (x - o_tf) / 100.0, M1t, transpose_b=True)
+            y = _t_asy_tf(_t_osz_tf(a), 0.2, fallback=a)
+            w = lam10_tf * tf.matmul(y, M2t, transpose_b=True)
             return tf.matmul(w, M1t, transpose_b=True)
 
         return z_np, z_tf
@@ -479,15 +512,17 @@ def _z_builders(func_no, dim, shift_block=0, rot_base=0, force_rotate=False):
         M2, M2t = rot(1)
 
         def z_np(x):
-            xb = (5.12 * (x - o) / 100.0) @ M1.T
-            y = np.where(np.abs(xb) <= 0.5, xb, np.round(2.0 * xb) / 2.0)
-            return (lam10 * (_t_asy_np(_t_osz_np(y), 0.2) @ M2.T)) @ M1.T
+            a = (5.12 * (x - o) / 100.0) @ M1.T
+            # C step: if |a|>0.5, a = floor(2a+0.5)/2 (round-half-up, not banker's).
+            a = np.where(np.abs(a) > 0.5, np.floor(2.0 * a + 0.5) / 2.0, a)
+            y = _t_asy_np(_t_osz_np(a), 0.2, fallback=a)
+            return (lam10 * (y @ M2.T)) @ M1.T
 
         def z_tf(x):
-            xb = tf.matmul(5.12 * (x - o_tf) / 100.0, M1t, transpose_b=True)
-            y = tf.where(tf.abs(xb) <= 0.5, xb, tf.round(2.0 * xb) / 2.0)
-            w = lam10_tf * tf.matmul(_t_asy_tf(_t_osz_tf(y), 0.2), M2t,
-                                     transpose_b=True)
+            a = tf.matmul(5.12 * (x - o_tf) / 100.0, M1t, transpose_b=True)
+            a = tf.where(tf.abs(a) > 0.5, tf.floor(2.0 * a + 0.5) / 2.0, a)
+            y = _t_asy_tf(_t_osz_tf(a), 0.2, fallback=a)
+            w = lam10_tf * tf.matmul(y, M2t, transpose_b=True)
             return tf.matmul(w, M1t, transpose_b=True)
 
         return z_np, z_tf
@@ -506,10 +541,11 @@ def _z_builders(func_no, dim, shift_block=0, rot_base=0, force_rotate=False):
 
     if n == 16:                                         # Katsuura
         M1, M1t = rot(0)
-        M2, M2t = rot(1)
-        return (lambda x: lam100 * (((5.0 * (x - o) / 100.0) @ M1.T) @ M2.T),
-                lambda x: lam100_tf * tf.matmul(
-                    tf.matmul(5.0 * (x - o_tf) / 100.0, M1t, transpose_b=True),
+        M2, M2t = rot(1)                                # C: M1 -> lambda -> M2
+        return (lambda x: (lam100 * ((5.0 * (x - o) / 100.0) @ M1.T)) @ M2.T,
+                lambda x: tf.matmul(
+                    lam100_tf * tf.matmul(5.0 * (x - o_tf) / 100.0, M1t,
+                                          transpose_b=True),
                     M2t, transpose_b=True))
 
     if n in (17, 18):                                   # Lunacek: raw y
@@ -517,17 +553,18 @@ def _z_builders(func_no, dim, shift_block=0, rot_base=0, force_rotate=False):
                 lambda x: 10.0 * (x - o_tf) / 100.0)
 
     if n == 19:                                         # Griewank+Rosenbrock
-        M1, M1t = rot(0)
-        return (lambda x: (5.0 * (x - o) / 100.0) @ M1.T + 1.0,
-                lambda x: tf.matmul(5.0 * (x - o_tf) / 100.0, M1t,
-                                    transpose_b=True) + 1.0)
+        # The C grie_rosen_func computes the rotation then OVERWRITES it with
+        # (scaled + 1), so the rotation is discarded -> no rotation here.
+        return (lambda x: 5.0 * (x - o) / 100.0 + 1.0,
+                lambda x: 5.0 * (x - o_tf) / 100.0 + 1.0)
 
     if n == 20:                                         # Expanded Schaffer F6
         M1, M1t = rot(0)
-        M2, M2t = rot(1)
-        return (lambda x: _t_asy_np((x - o) @ M1.T, 0.5) @ M2.T,
+        M2, M2t = rot(1)                                # asy fallback = pre-rotate
+        return (lambda x: _t_asy_np((x - o) @ M1.T, 0.5, fallback=x - o) @ M2.T,
                 lambda x: tf.matmul(
-                    _t_asy_tf(tf.matmul(x - o_tf, M1t, transpose_b=True), 0.5),
+                    _t_asy_tf(tf.matmul(x - o_tf, M1t, transpose_b=True), 0.5,
+                              fallback=x - o_tf),
                     M2t, transpose_b=True))
 
     raise KeyError(f"CEC'13 function {n} not implemented.")
@@ -542,9 +579,12 @@ def _lunacek_params(dim):
     return mu0, mu1, s, d_par
 
 
-def _lunacek_np(y, dim, rotate):
+def _lunacek_np(y, o, dim, rotate):
+    # C: tmpx = 2*y; if Os[i]<0 tmpx*=-1  ->  sign of the SHIFT (Os>=0 gives +1,
+    # including exactly 0). x_bar = tmpx + mu0.
     mu0, mu1, s, d_par = _lunacek_params(dim)
-    x_bar = 2.0 * np.sign(y) * y + mu0
+    sgn = np.where(np.asarray(o, np.float64) < 0.0, -1.0, 1.0)
+    x_bar = 2.0 * sgn * y + mu0
     t1 = np.sum((x_bar - mu0) ** 2, axis=-1)
     t2 = d_par * dim + s * np.sum((x_bar - mu1) ** 2, axis=-1)
     lam = _lambda_diag(dim, 100.0)
@@ -557,9 +597,11 @@ def _lunacek_np(y, dim, rotate):
             + 10.0 * (dim - np.sum(np.cos(2.0 * np.pi * z), axis=-1)))
 
 
-def _lunacek_tf(y, dim, rotate):
+def _lunacek_tf(y, o, dim, rotate):
     mu0, mu1, s, d_par = _lunacek_params(dim)
-    x_bar = 2.0 * tf.sign(y) * y + mu0
+    sgn = tf.constant(np.where(np.asarray(o, np.float64) < 0.0, -1.0, 1.0),
+                      tf.float32)
+    x_bar = 2.0 * sgn * y + mu0
     t1 = tf.reduce_sum((x_bar - mu0) ** 2, axis=-1)
     t2 = d_par * dim + s * tf.reduce_sum((x_bar - mu1) ** 2, axis=-1)
     lam = tf.constant(_lambda_diag(dim, 100.0), tf.float32)
@@ -666,13 +708,15 @@ def _build(name, dim):
 
     if n in (17, 18):
         rotate = (n == 18)
+        o = shift_for(n, dim)                          # sign source for x_bar
+        o_tf = tf.constant(o, tf.float32)
 
         def eval_np(x):
             y = z_np(np.atleast_2d(np.asarray(x, np.float64)))
-            return float(_lunacek_np(y, dim, rotate)[0] + bias)
+            return float(_lunacek_np(y, o, dim, rotate)[0] + bias)
 
         def eval_tf(x):
-            return _lunacek_tf(z_tf(x), dim, rotate) + bias
+            return _lunacek_tf(z_tf(x), o_tf, dim, rotate) + bias
     else:
         g_np, g_tf = _BASE_NP[n], _BASE_TF[n]
 

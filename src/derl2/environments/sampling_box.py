@@ -37,6 +37,8 @@ class SamplingBox:
     half_width: np.ndarray      # (D,) intended box half-width (scaled + floored)
     box_at_floor: bool          # did the collapse floor bind in any dimension?
     incumbent_in_box: bool      # does best-so-far lie inside [box_lo, box_hi]?
+    chol: object = None         # (D,D) scaled Cholesky for a COVARIANCE box, else
+                                # None (axis-aligned): population = center + z @ chol.T
 
 
 def transform_box(final_population, scale, box_min_frac,
@@ -106,4 +108,71 @@ def transform_box(final_population, scale, box_min_frac,
         half_width=scaled.astype(np.float32),
         box_at_floor=box_at_floor,
         incumbent_in_box=incumbent_in_box,
+    )
+
+
+def transform_covariance(final_population, scale, box_min_frac,
+                         domain_lo, domain_hi, box_center, incumbent, rng=None):
+    """Covariance sampling box (spec §6.1 variant).
+
+    Same concept as transform_box -- the agent expands/contracts the region the
+    next population is drawn from -- but the region is now an ORIENTED ELLIPSOID
+    carrying the covariance of the previous segment's final population, not an
+    axis-aligned box. The next population is sampled as
+
+        x = center + z @ chol.T ,   z ~ N(0, I)
+
+    where `chol = scale * L`, `L = cholesky(Sigma_reg)`, so `scale` multiplies the
+    STANDARD DEVIATION (a 2x scale doubles the ellipsoid's radius) -- matching
+    transform_box's linear box-scale semantics. box_lo/box_hi are the +/-1-sigma
+    bounding box, exposed only for the observation's box features.
+
+    Sigma_reg is the population covariance with an additive per-dimension variance
+    floor of (box_min_frac * domain_half_width)^2, which keeps it positive-definite
+    (Cholesky-able) and stops the ellipsoid collapsing below the same floor the
+    axis box uses. `center` follows the same centroid/incumbent/random choice.
+    """
+    pop = np.asarray(final_population, dtype=np.float64)
+    domain_lo = np.asarray(domain_lo, dtype=np.float64)
+    domain_hi = np.asarray(domain_hi, dtype=np.float64)
+    incumbent = np.asarray(incumbent, dtype=np.float64)
+    d = pop.shape[1]
+    half = (domain_hi - domain_lo) / 2.0
+
+    if box_center == "centroid":
+        center = pop.mean(axis=0)
+    elif box_center == "incumbent":
+        center = incumbent.copy()
+    elif box_center == "random":
+        if rng is None:
+            raise ValueError("box_center='random' requires an rng.")
+        center = domain_lo + rng.random(d) * (domain_hi - domain_lo)
+    else:
+        raise ValueError(
+            f"box_center must be 'centroid', 'incumbent' or 'random', "
+            f"got {box_center!r}.")
+
+    sigma_mat = (np.cov(pop, rowvar=False) if pop.shape[0] > 1
+                 else np.zeros((d, d)))
+    sigma_mat = np.atleast_2d(sigma_mat)
+    floor_var = (box_min_frac * half) ** 2                 # (D,) min variance
+    box_at_floor = bool(np.any(np.diag(sigma_mat) < floor_var))
+    sigma_mat = sigma_mat + np.diag(floor_var)             # additive variance floor
+    L = np.linalg.cholesky(sigma_mat)                      # (D,D) lower-triangular
+    chol = scale * L                                       # scale the std (spread)
+
+    sd = scale * np.sqrt(np.diag(sigma_mat))               # +/-1-sigma per dim
+    box_lo = np.clip(center - sd, domain_lo, domain_hi)
+    box_hi = np.clip(center + sd, domain_lo, domain_hi)
+    incumbent_in_box = bool(np.all(incumbent >= box_lo)
+                            and np.all(incumbent <= box_hi))
+
+    return SamplingBox(
+        box_lo=box_lo.astype(np.float32),
+        box_hi=box_hi.astype(np.float32),
+        center=center.astype(np.float32),
+        half_width=sd.astype(np.float32),
+        box_at_floor=box_at_floor,
+        incumbent_in_box=incumbent_in_box,
+        chol=chol.astype(np.float32),
     )

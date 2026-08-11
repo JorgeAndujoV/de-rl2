@@ -1,0 +1,83 @@
+experiment: EXP017_hybridppo_cov_15k
+seed: 0
+
+# EXP017: EXP014 (Hybrid PPO, continuous action space, 15k episodes) with the NEW
+# COVARIANCE sampling box. Instead of an axis-aligned box from the population's
+# per-dimension extent, the next population is drawn from an oriented Gaussian
+# ellipsoid carrying the covariance of the previous segment's final population;
+# the agent's box_scale multiplies its STANDARD DEVIATION (same expand/contract
+# semantics as before, but the region now captures inter-variable correlations).
+# First test on f2 only.
+
+benchmark:
+  name: cec13
+  functions: [2]               # cov-box first test: f2 only
+  dim: 30
+  budget: 300000
+
+episode:
+  pop_size: 50
+  warmup_frac: 0.05
+  warmup: {strategy: rand/1/bin, F: 0.5, CR: 0.9}
+  box_center: centroid
+  box_scales: [1.0]
+  box_min_frac: 0.0417
+  elitism: false
+  truncate_last_segment: true
+
+environment:
+  observation: traj20_contbox
+  n_checkpoints: 20
+  action_space: param_strategy_continuous
+  sampling_box: covariance     # <-- covariance ellipsoid (box_scale scales the std)
+  f_range: [0.0, 1.0]
+  cr_range: [0.0, 1.0]
+  budget_range: [0.05, 0.95]
+  box_scale_range: [0.25, 3.0]
+  strategy_profiles:
+    - {strategy: rand/1/bin}
+    - {strategy: best/1/bin}
+    - {strategy: current-to-best/1/bin}
+    - {strategy: rand/2/bin}
+  reward: {name: log_stagnation, lambda: 0.1, tau_stag: 3}
+
+agent:
+  name: hybrid_ppo
+  param_dim: 4
+  discounting: per_budget
+  gamma: 0.99
+  gae_lambda: 0.95
+  lr: 3.0e-4
+  policy_hidden: [128, 128]
+  value_hidden: [128, 128]
+  clip: 0.2
+  epochs: 10
+  minibatch_size: 64
+  entropy_coef: 0.01
+  value_coef: 0.5
+  max_grad_norm: 0.5
+  rollout_steps: 512
+  n_envs: 8
+
+training:
+  episodes: 15000
+  eval_every: 2000
+  eval_episodes: 10
+  checkpoint_every: 2000
+  periodic_eval: {start: 1000, every: 1000}
+
+evaluation:
+  runs_per_function: 51
+  seed_offset: 900000
+  save_trajectory_seeds: 3
+  # One set per configuration: continuous action space + COVARIANCE box (shared
+  # with EXP018; the random baseline runs through the covariance-box env).
+  baseline_namespace: BASE_CONT_COV
+  compare_against: [BASE001_de_plain, BASE003_random]
+
+slurm:
+  time: "5-00:00:00"
+  mem: "16G"
+  cpus: 8
+  gpus: 0
+  account: def-bolufe

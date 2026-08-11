@@ -33,7 +33,7 @@ from derl2.benchmarks import build_benchmark
 from derl2.environments.action_spaces import build_action_space
 from derl2.environments.observations import build_observation
 from derl2.environments.rewards import build_reward
-from derl2.environments.sampling_box import transform_box
+from derl2.environments.sampling_box import transform_box, transform_covariance
 
 # "all" resolves to the full implemented CEC'13 set (f1–f28, including the
 # composition functions f21–f28; see benchmarks/cec13.py).
@@ -47,7 +47,7 @@ class DEEnv:
                  action_space, budget_fracs, strategy_profiles, reward,
                  budget_range=None, box_scale_range=None,
                  f_range=None, cr_range=None,
-                 np_range=None, box_centers=None,
+                 np_range=None, box_centers=None, sampling_box="axis",
                  exp_id=None, is_smoke=False):
         if elitism:
             raise ValueError(
@@ -63,6 +63,14 @@ class DEEnv:
         self.warmup_frac = warmup_frac
         self.warmup = warmup                       # {strategy, F, CR}
         self.box_center = box_center
+        # 'axis' (default): axis-aligned box from the population's per-dim extent.
+        # 'covariance': an oriented Gaussian ellipsoid carrying the population's
+        # covariance; the agent's box_scale multiplies its standard deviation.
+        if sampling_box not in ("axis", "covariance"):
+            raise ValueError(
+                f"environment.sampling_box must be 'axis' or 'covariance', "
+                f"got {sampling_box!r}.")
+        self.sampling_box_mode = sampling_box
         self.box_scales = list(box_scales)
         self.box_min_frac = box_min_frac
         self.truncate_last_segment = truncate_last_segment
@@ -144,6 +152,7 @@ class DEEnv:
             cr_range=cfg.get("environment.cr_range", None),
             np_range=cfg.get("environment.np_range", None),
             box_centers=cfg.get("environment.box_centers", None),
+            sampling_box=cfg.get("environment.sampling_box", "axis"),
             exp_id=cfg.exp_id,
             is_smoke=cfg.is_smoke,
         )
@@ -267,14 +276,18 @@ class DEEnv:
         # space offers one (param_strategy_boxnp), else the fixed episode default.
         box_center = decoded.get("box_center", self.box_center)
 
-        # Transform the previous segment's population into this segment's box.
-        # 'random' centers draw from the episode RNG, keeping the episode
-        # reproducible for a given (seed, function).
-        box = transform_box(
+        # Transform the previous segment's population into this segment's sampling
+        # region: an axis-aligned box, or (sampling_box='covariance') an oriented
+        # Gaussian ellipsoid carrying the population's covariance. 'random' centers
+        # draw from the episode RNG, keeping (seed, function) reproducible.
+        _transform = (transform_covariance
+                      if self.sampling_box_mode == "covariance" else transform_box)
+        box = _transform(
             self._prev_segment.final_population, box_scale, self.box_min_frac,
             self._domain_lo, self._domain_hi,
             box_center, self._global_best_solution, rng=self._seed_rng,
         )
+        seg_cov = (box.center, box.chol) if box.chol is not None else None
 
         fes_before = self._fes_used
         remaining = self.budget - fes_before
@@ -300,6 +313,7 @@ class DEEnv:
             decoded["strategy"], decoded["F"], decoded["CR"],
             fe_budget, self.n_checkpoints,
             seed=int(self._seed_rng.integers(0, 2**31 - 1)),
+            cov=seg_cov,
         )
         self._fes_used += seg.fes_used
 
