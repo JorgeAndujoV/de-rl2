@@ -2,12 +2,12 @@ experiment: EXP018_hybridsac_cov_15k
 seed: 0
 
 # EXP018: EXP015 (Hybrid SAC, continuous action space, 15k episodes) with the NEW
-# COVARIANCE sampling box (see EXP017). First test on f2 only. Shares the
-# continuous + covariance baseline set with EXP017.
+# COVARIANCE sampling box (see EXP017). Swept over the full 11-function test set.
+# Shares the continuous + covariance baseline set with EXP017.
 
 benchmark:
   name: cec13
-  functions: [2]
+  functions: [2, 6, 11, 12, 17, 3, 7, 15, 10, 16, 22]
   dim: 30
   budget: 300000
 

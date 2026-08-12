@@ -7,11 +7,12 @@ seed: 0
 # ellipsoid carrying the covariance of the previous segment's final population;
 # the agent's box_scale multiplies its STANDARD DEVIATION (same expand/contract
 # semantics as before, but the region now captures inter-variable correlations).
-# First test on f2 only.
+# f2 was validated first (already completed); now swept over the full 11-function
+# test set.
 
 benchmark:
   name: cec13
-  functions: [2]               # cov-box first test: f2 only
+  functions: [2, 6, 11, 12, 17, 3, 7, 15, 10, 16, 22]
   dim: 30
   budget: 300000
 

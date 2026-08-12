@@ -4,12 +4,13 @@ seed: 0
 # EXP019: EXP016 (Hybrid PPO, larger param_strategy_boxnp action space, 15k
 # episodes) with the NEW COVARIANCE sampling box (see EXP017). The agent still
 # chooses NP, the box centre and the strategy; the box it scales is now the
-# population's covariance ellipsoid. First test on f2 only. Own baseline set
-# (boxnp action space + covariance box).
+# population's covariance ellipsoid. f2 was validated first (already completed);
+# now swept over the full 11-function test set. Own baseline set (boxnp action
+# space + covariance box).
 
 benchmark:
   name: cec13
-  functions: [2]
+  functions: [2, 6, 11, 12, 17, 3, 7, 15, 10, 16, 22]
   dim: 30
   budget: 300000
 
