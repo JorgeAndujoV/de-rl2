@@ -1,2 +1,0 @@
-training_step,elapsed_seconds,mean_return,std_return,mean_loss,mean_eval_fitness,std_eval_fitness,mean_episode_length
-2000,7535.88,-1.635538,0.317472,0.064129,2.198212e+01,9.648883e+00,3.4930

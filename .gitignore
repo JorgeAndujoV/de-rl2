@@ -5,13 +5,20 @@ __pycache__/
 *.egg-info/
 runs/
 
-# Result artifacts: the small records — summary.csv, training_log.csv,
-# episode_results.csv, eval_results.csv, comparison.csv, run_metadata.json — ARE
-# committed (they are the record of an experiment). The bulky/regenerable ones
-# are not.
+# Per-run experiment OUTPUTS are NOT tracked. They are regenerated on the cluster
+# and retrieved via rsync (WSL is the source of truth). Tracking them made Nibi
+# `git pull` abort — a job's freshly regenerated, still-untracked files collide
+# with the committed copies. Only each experiment's config.yaml and
+# experiments/REGISTRY.csv stay tracked. After adding these rules, drop the
+# already-tracked copies from the index once with:
+#   git ls-files -i -c --exclude-standard -z | xargs -0 -r git rm --cached
 slurm_logs/
 experiments/**/checkpoints/
 experiments/**/trajectories/
+experiments/**/eval/
+experiments/**/training_log.csv
+experiments/**/progress_log.csv
+experiments/**/run_metadata.json
 # Generated analysis figures (scripts/analyze_experiment.py).
 tests/
 # Baselines are generated per-experiment by each job (run_experiment.sh, via
