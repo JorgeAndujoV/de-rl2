@@ -67,6 +67,31 @@ def random_policy(action_space, seed=12345):
     return lambda obs: action_space.sample_random(rng)
 
 
+class GreedyPolicy:
+    """Greedy evaluation policy for a trained agent, recurrent-aware.
+
+    For a feedforward agent it is just ``agent.act(obs, epsilon=0)``. For a
+    recurrent agent (``agent.recurrent``) it threads a per-episode hidden state:
+    ``reset()`` re-zeros the state (call it at each episode start — run_episode
+    does) and each call advances it via ``agent.act_eval(obs, state)``."""
+
+    def __init__(self, agent):
+        self.agent = agent
+        self.recurrent = getattr(agent, "recurrent", False)
+        self.state = None
+
+    def reset(self):
+        self.state = self.agent.initial_state() if self.recurrent else None
+
+    def __call__(self, obs):
+        if not self.recurrent:
+            return self.agent.act(obs, epsilon=0.0)
+        if self.state is None:
+            self.state = self.agent.initial_state()
+        action, self.state = self.agent.act_eval(obs, self.state)
+        return action
+
+
 # ----------------------------------------------------------- schemas
 
 EPISODE_COLUMNS = ["function_id", "seed", "final_error", "n_steps",
@@ -90,6 +115,10 @@ def run_episode(env, seed, function_id, policy):
     """One greedy episode; returns (episode_row, step_infos, trajectories)."""
     t0 = time.perf_counter()          # monotonic; time.time() can step back
     obs, info = env.reset(seed=seed, function_id=function_id)
+    # A recurrent greedy policy carries hidden state across the episode; reset it
+    # at the start of every episode so runs never leak state into each other.
+    if hasattr(policy, "reset"):
+        policy.reset()
     step_infos, trajectories, ep_return = [], [], 0.0
     done = False
     while not done:
@@ -133,7 +162,9 @@ def build_agent_policy(train_dir, cfg, env):
     tf.train.Checkpoint(**agent.checkpoint_items()).restore(latest) \
         .expect_partial()
     print(f"checkpoint {latest}")
-    return lambda obs: agent.act(obs, epsilon=0.0)
+    # GreedyPolicy is recurrent-aware: identical to agent.act for feedforward
+    # agents, and threads/resets a per-episode hidden state for recurrent ones.
+    return GreedyPolicy(agent)
 
 
 def write_summary(path, episode_rows):

@@ -37,7 +37,7 @@ from derl2 import run_metadata
 from derl2.agents import build_agent
 from derl2.config import Config, experiments_dir
 from derl2.environments import DEEnv
-from derl2.evaluation.evaluate import (check_baselines_available,
+from derl2.evaluation.evaluate import (GreedyPolicy, check_baselines_available,
                                        evaluate_policy)
 
 # Seed offset for the greedy evaluation rollouts run during training. Kept well
@@ -82,14 +82,18 @@ def eval_rollouts(env, agent, n_episodes):
     """Greedy rollouts for the learning curve; returns final errors.
 
     Uses a dedicated env so it never disturbs the training episode, and a fixed
-    seed set so successive checkpoints are comparable."""
+    seed set so successive checkpoints are comparable. GreedyPolicy is
+    recurrent-aware: for a recurrent agent it threads a per-episode hidden state
+    (reset here at each episode start), for a feedforward one it is agent.act."""
+    policy = GreedyPolicy(agent)
     fits = []
     for i in range(n_episodes):
         obs, _ = env.reset(seed=_TRAIN_EVAL_SEED_OFFSET + i)
+        policy.reset()
         done = False
         info = {}
         while not done:
-            obs, _, term, trunc, info = env.step(agent.act(obs, epsilon=0.0))
+            obs, _, term, trunc, info = env.step(policy(obs))
             done = term or trunc
         fits.append(info["best_error"])
     return np.array(fits, dtype=np.float64)
@@ -219,8 +223,7 @@ def main():
             shutil.copyfile(log_path,
                             os.path.join(eval_dir, "training_log.csv"))
         try:
-            evaluate_policy(cfg, eval_env,
-                            lambda obs: agent.act(obs, epsilon=0.0), eval_dir)
+            evaluate_policy(cfg, eval_env, GreedyPolicy(agent), eval_dir)
             # Copy this checkpoint's outputs to the persisted location NOW, so
             # $HOME fills in progressively rather than only when the persist trap
             # runs at job end — the whole point of evaluating during training.
@@ -394,8 +397,121 @@ def main():
         log_file.close(); progress_file.close()
         print(f"Training finished. Output in {out_dir}")
 
+    # --------------------------------------------- recurrent on-policy loop (RNN)
+    def run_on_policy_recurrent():
+        """Episode-aligned recurrent PPO loop (EXP020). Collects WHOLE episodes
+        from n_envs parallel envs, threading a per-env hidden state that resets
+        at each episode boundary; computes SMDP-GAE per complete episode; and
+        updates the recurrent agent over whole-episode minibatches. Reuses the
+        SAME checkpoint / eval / logging / walltime cadence as the other loops.
+
+        Episodes may span collection rounds, so per-env transitions accumulate in
+        `acc[i]` until that env signals done; only then is the whole episode
+        flushed (as one training sequence starting at h_0=0). `state[i]` is the
+        recurrent hidden state, reset to zero on each done."""
+        nonlocal next_eval_at, next_ckpt_at
+        from derl2.environments.vec_env import make_vec_env
+        from derl2.agents.hybrid_ppo import compute_gae
+
+        n_envs = agent.n_envs
+        target = agent.episodes_per_update
+        venv = make_vec_env(cfg, n_envs, base_seed=seed,
+                            backend=cfg.get("environment.vec_backend", None))
+        obs = venv.reset()
+        acc = [[] for _ in range(n_envs)]      # per-env in-progress transitions
+        state = [agent.initial_state() for _ in range(n_envs)]
+        completed = start
+        k_done = (start // periodic_every) if periodic_every else 0
+        try:
+            while completed < episodes:
+                # ---- collect whole episodes until >= target complete ----
+                batch_eps = []
+                roll_returns, roll_lengths = [], []
+                while len(batch_eps) < target:
+                    triples = [agent.act_collect(obs[i], state[i])
+                               for i in range(n_envs)]
+                    for i in range(n_envs):
+                        state[i] = triples[i][3]
+                    next_obs, rewards, dones, infos = venv.step(
+                        [t[0] for t in triples])
+                    for i in range(n_envs):
+                        (a, lp, v, _) = triples[i]
+                        acc[i].append(
+                            (obs[i], a[0], a[1], lp, v, float(rewards[i]),
+                             float(dones[i]), float(infos[i]["tau"])))
+                        if dones[i] > 0.5:
+                            ep = acc[i]
+                            # Complete episode: dones[-1]=1 so the GAE bootstrap
+                            # term vanishes (last_value=0 is unused).
+                            adv, ret = compute_gae(
+                                [r[5] for r in ep], [r[4] for r in ep],
+                                [r[6] for r in ep], [r[7] for r in ep], 0.0,
+                                agent.gamma, agent.gae_lambda, agent.per_budget)
+                            batch_eps.append({
+                                "obs": np.asarray([r[0] for r in ep], np.float32),
+                                "k": np.asarray([r[1] for r in ep], np.int32),
+                                "params": np.asarray([r[2] for r in ep],
+                                                     np.float32),
+                                "old_logp": np.asarray([r[3] for r in ep],
+                                                       np.float32),
+                                "adv": np.asarray(adv, np.float32),
+                                "ret": np.asarray(ret, np.float32)})
+                            ep_ret = float(sum(r[5] for r in ep))
+                            returns.append(ep_ret); lengths.append(len(ep))
+                            roll_returns.append(ep_ret)
+                            roll_lengths.append(len(ep))
+                            completed += 1
+                            acc[i] = []
+                            state[i] = agent.initial_state()
+                    obs = next_obs
+
+                # ---- one recurrent PPO update over the whole episodes ----
+                loss = agent.update(batch_eps)
+                losses.append(loss)
+                episode_var.assign(completed)
+
+                progress_logger.writerow([
+                    int(agent.train_steps.numpy()), completed,
+                    f"{np.mean(roll_returns):.6f}" if roll_returns else "nan",
+                    f"{float(loss):.6f}",
+                    f"{np.mean(roll_lengths):.4f}" if roll_lengths else "nan"])
+                progress_file.flush()
+
+                # ---- cadence: eval/ckpt on train steps, periodic on episodes ---
+                ts = int(agent.train_steps.numpy())
+                if ts >= next_ckpt_at:
+                    manager.save(); next_ckpt_at += checkpoint_every
+                if ts >= next_eval_at:
+                    log_checkpoint(); next_eval_at += eval_every
+                if periodic_every:
+                    k_target = completed // periodic_every
+                    if k_target > k_done and completed >= periodic_start:
+                        k_done = k_target
+                        periodic_checkpoint(k_done, completed)
+
+                # ---- cluster walltime safety ----
+                if args.max_hours and (time.perf_counter() - t_start) / 3600.0 \
+                        > args.max_hours:
+                    manager.save(); venv.close()
+                    log_file.close(); progress_file.close()
+                    print(f"Walltime limit reached at episode {completed}; "
+                          f"checkpointed. Re-run the same command to resume.")
+                    sys.exit(42)
+        finally:
+            venv.close()
+
+        if returns or losses:
+            log_checkpoint()
+        manager.save()
+        final_manager.save()
+        log_file.close(); progress_file.close()
+        print(f"Training finished. Output in {out_dir}")
+
     if on_policy:
-        run_on_policy_training()
+        if getattr(agent, "recurrent", False):
+            run_on_policy_recurrent()
+        else:
+            run_on_policy_training()
         return
 
     for episode in range(start, episodes):

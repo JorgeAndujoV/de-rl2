@@ -1,0 +1,90 @@
+experiment: EXP020_hybridppo_rnn_15k
+seed: 0
+
+# EXP020: EXP016 with a RECURRENT (GRU) Hybrid-PPO agent -- a pure recurrence
+# ablation. The action space (param_strategy_boxnp), observation
+# (traj20_contboxnp, 99-dim, including its hand-engineered memory features),
+# reward, functions, budget and 15k-episode scale are IDENTICAL to EXP016. The
+# only change is the policy/value networks: MLP -> separate GRU trunks, so the
+# policy conditions on a hidden state h_t carried across the ~19 segment
+# decisions of an episode instead of on the current observation alone. The RNN's
+# own hyperparameters are chosen for the recurrent setting (not constrained to
+# EXP016's schedule): episode-aligned collection, whole-episode minibatches with
+# exact hidden-state recompute, GRU-128, fewer epochs. Shares EXP016's baselines
+# (env/action/obs/reward unchanged -> baselines are agent-independent).
+
+benchmark:
+  name: cec13
+  functions: [2, 6, 11, 12, 17, 3, 7, 15, 10, 16, 22]
+  dim: 30
+  budget: 300000
+
+episode:
+  pop_size: 50                 # warm-up NP (fixed); agent sets NP per segment
+  warmup_frac: 0.05
+  warmup: {strategy: rand/1/bin, F: 0.5, CR: 0.9}
+  box_center: centroid         # fallback; the agent chooses per segment
+  box_scales: [1.0]
+  box_min_frac: 0.0417
+  elitism: false
+  truncate_last_segment: true
+
+environment:
+  observation: traj20_contboxnp
+  n_checkpoints: 20
+  action_space: param_strategy_boxnp
+  f_range: [0.0, 1.0]
+  cr_range: [0.0, 1.0]
+  budget_range: [0.05, 0.95]
+  box_scale_range: [0.25, 3.0]
+  np_range: [16, 400]
+  box_centers: [centroid, incumbent, random]
+  strategy_profiles:
+    - {strategy: rand/1/bin}
+    - {strategy: best/1/bin}
+    - {strategy: current-to-best/1/bin}
+    - {strategy: rand/2/bin}
+    - {strategy: current-to-pbest/1/bin}
+  reward: {name: log_stagnation, lambda: 0.1, tau_stag: 3}
+
+agent:
+  name: hybrid_ppo_rnn
+  param_dim: 5                 # F, CR, budget_frac, box_scale, NP
+  discounting: per_budget
+  gamma: 0.99
+  gae_lambda: 0.95
+  lr: 3.0e-4
+  cell: gru
+  rnn_hidden: 128              # GRU hidden size (matches the MLP width)
+  head_hidden: [128]           # post-GRU MLP head before the policy/value outputs
+  clip: 0.2
+  epochs: 6                    # fewer than the MLP's 10 (recurrent stability)
+  minibatch_episodes: 32       # a minibatch is 32 whole episodes (not 64 steps)
+  episodes_per_update: 256     # whole episodes collected per PPO update
+  entropy_coef: 0.01
+  value_coef: 0.5
+  max_grad_norm: 0.5
+  n_envs: 8
+
+training:
+  episodes: 15000              # -> 15 periodic checkpoints (every 1000)
+  eval_every: 2000
+  eval_episodes: 10
+  checkpoint_every: 2000
+  periodic_eval: {start: 1000, every: 1000}
+
+evaluation:
+  runs_per_function: 51
+  seed_offset: 900000
+  save_trajectory_seeds: 3
+  # Reuse EXP016's baselines: identical env/action/obs/reward -> baselines are
+  # agent-independent, so the boxnp+axis set is valid unchanged.
+  baseline_namespace: BASE_BOXNP_AXIS
+  compare_against: [BASE001_de_plain, BASE003_random]
+
+slurm:
+  time: "5-00:00:00"
+  mem: "16G"
+  cpus: 8
+  gpus: 0
+  account: def-bolufe

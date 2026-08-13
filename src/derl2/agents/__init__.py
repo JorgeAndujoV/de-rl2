@@ -14,12 +14,14 @@ is invisible to it.
 from derl2.agents.dqn import DQNAgent
 from derl2.agents.mpdqn import MPDQNAgent
 from derl2.agents.hybrid_ppo import HybridPPOAgent
+from derl2.agents.hybrid_ppo_rnn import HybridPPORNNAgent
 from derl2.agents.hybrid_sac import HybridSACAgent
 
 AGENTS = {
     "dqn": DQNAgent,
     "mpdqn": MPDQNAgent,
     "hybrid_ppo": HybridPPOAgent,
+    "hybrid_ppo_rnn": HybridPPORNNAgent,
     "hybrid_sac": HybridSACAgent,
 }
 
