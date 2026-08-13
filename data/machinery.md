@@ -64,16 +64,28 @@ budget. It unfolds as:
 
 3. **Act.** The agent reads the observation and emits a single **action** — one
    integer in `0..59`. That integer decodes into three simultaneous choices:
-   - which **DE strategy** to use (4 options),
-   - what fraction of the total budget to spend on this next burst (**budget
-     fraction**: 5%, 10%, or 15%),
+   - which **DE strategy** to use (5 options),
+   - what fraction of the total budget to spend on this next burst [0.05, 0.95],
    - how to build the **sampling box** — the region the fresh population is drawn
-     from (5 options, from "much wider than the last population" to "tighter than
-     it").
-
-   The **F and CR** DE parameters are *not* chosen by the agent; each strategy
-   carries its own fixed F/CR (see §2, §6). The agent chooses the strategy, and
-   F/CR ride along with it.
+     from [0.25, 3.0].
+      f_range: [0.0, 1.0]
+      cr_range: [0.0, 1.0]
+      we are trying to see if we add the sampling box as a regular box or as the covariance matrix of final population.
+      also we have as actions the NP and where the sampling box is initialized (random, center or incumbent), te complete action space is the following: 
+        action_space: param_strategy_boxnp
+        f_range: [0.0, 1.0]
+        cr_range: [0.0, 1.0]
+        budget_range: [0.05, 0.95]
+        box_scale_range: [0.25, 3.0]
+        np_range: [16, 400]
+        box_centers: [centroid, incumbent, random]
+        strategy_profiles:
+          - {strategy: rand/1/bin}
+          - {strategy: best/1/bin}
+          - {strategy: current-to-best/1/bin}
+          - {strategy: rand/2/bin}
+          - {strategy: current-to-pbest/1/bin}
+        reward: {name: log_stagnation, lambda: 0.1, tau_stag: 3}
 
 4. **Transform the box.** The previous segment's final population has a bounding
    box. The chosen sampling-box action scales that box (wider or tighter),

@@ -18,5 +18,7 @@ tests/
 # run_baseline --skip-existing); regenerable, rsync back if a local copy is wanted.
 baselines/
 *.bak.*
-
+cec13-c-code/
+cec13 python benchmark/
+results/
 scripts/MACHINERY.md
