@@ -33,7 +33,8 @@ from derl2.benchmarks import build_benchmark
 from derl2.environments.action_spaces import build_action_space
 from derl2.environments.observations import build_observation
 from derl2.environments.rewards import build_reward
-from derl2.environments.sampling_box import transform_box, transform_covariance
+from derl2.environments.sampling_box import (build_frame, sample_from_box,
+                                             transform_box, transform_covariance)
 
 # "all" resolves to the full implemented CEC'13 set (f1–f28, including the
 # composition functions f21–f28; see benchmarks/cec13.py).
@@ -48,6 +49,7 @@ class DEEnv:
                  budget_range=None, box_scale_range=None,
                  f_range=None, cr_range=None,
                  np_range=None, box_centers=None, sampling_box="axis",
+                 elite_range=None, box_shapes=None, sampling_rules=None,
                  exp_id=None, is_smoke=False):
         if elitism:
             raise ValueError(
@@ -82,7 +84,10 @@ class DEEnv:
         for _name, _val in (("f_range", f_range), ("cr_range", cr_range),
                             ("budget_range", budget_range),
                             ("box_scale_range", box_scale_range),
-                            ("np_range", np_range), ("box_centers", box_centers)):
+                            ("np_range", np_range), ("box_centers", box_centers),
+                            ("elite_range", elite_range),
+                            ("box_shapes", box_shapes),
+                            ("sampling_rules", sampling_rules)):
             if _val is not None:
                 _as_kwargs[_name] = _val
         self.action = build_action_space(action_space, strategy_profiles,
@@ -103,6 +108,10 @@ class DEEnv:
         # existing (fixed-NP) action space is unaffected.
         self._has_np_action = hasattr(self.action, "np_norm")
         self._np_min = int(getattr(self.action, "np_min", self.pop_size))
+        # freedom++ (EXP021/EXP022): multi-head discrete action + elite carryover
+        # + agent-chosen box shape/sampling rule. Gated so every other experiment
+        # takes the unchanged path below.
+        self._freedompp = getattr(self.action, "is_freedompp", False)
         # exp_id/is_smoke are threaded through only for rewards that need to read
         # a frozen per-function baseline (median_stagnation -> m_i); every other
         # reward ignores them. lambda/tau_stag default so a reward config that
@@ -153,6 +162,9 @@ class DEEnv:
             np_range=cfg.get("environment.np_range", None),
             box_centers=cfg.get("environment.box_centers", None),
             sampling_box=cfg.get("environment.sampling_box", "axis"),
+            elite_range=cfg.get("environment.elite_range", None),
+            box_shapes=cfg.get("environment.box_shapes", None),
+            sampling_rules=cfg.get("environment.sampling_rules", None),
             exp_id=cfg.exp_id,
             is_smoke=cfg.is_smoke,
         )
@@ -177,6 +189,21 @@ class DEEnv:
         """Mean over dimensions of (hi - lo) / domain width."""
         return float(np.mean((hi - lo) / self._domain_width))
 
+    def _shape_stats(self, final_population, eff_radius_box):
+        """freedom++ shape-aware summary of a finished population:
+        (B5 effective-radius contraction, B7 anisotropy).
+
+        B5 = det(Sigma_final)^(1/2D) / eff_radius_box; B7 = log10(cond(Sigma_final)).
+        det^(1/2D) = exp(0.5 * mean(log eigenvalues)); eigenvalues floored for
+        numerical safety (a degenerate/rank-deficient population)."""
+        cov = np.atleast_2d(np.cov(np.asarray(final_population, dtype=np.float64),
+                                   rowvar=False))
+        eig = np.clip(np.linalg.eigvalsh(cov), 1e-30, None)
+        eff_final = float(np.exp(0.5 * np.mean(np.log(eig))))
+        b5 = eff_final / (eff_radius_box + 1e-12)
+        b7 = float(np.log10(eig.max() / eig.min()))
+        return b5, b7
+
     # --------------------------------------------------------------- reset
     def reset(self, seed=0, function_id=None):
         """Start an episode: pick a function, run the warm-up segment, and
@@ -193,6 +220,12 @@ class DEEnv:
         self._domain_lo = np.full(self.dim, spec.lower, dtype=np.float32)
         self._domain_hi = np.full(self.dim, spec.upper, dtype=np.float32)
         self._domain_width = self._domain_hi - self._domain_lo
+        # freedom++ domain frame: the whole domain as the reference region, used
+        # for the warm-up's whitened A1 and as the first observation's region.
+        self._domain_half = self._domain_width / 2.0
+        self._domain_center = (self._domain_lo + self._domain_hi) / 2.0
+        self._domain_eff_radius = float(np.exp(np.mean(np.log(self._domain_half))))
+        self._halton_offset = 0            # advances per freedom++ restart
 
         # Warm-up: full-domain init, fixed config, warmup_frac of the budget.
         from derl2.optimizers import run_segment
@@ -202,6 +235,8 @@ class DEEnv:
             self.warmup["strategy"], self.warmup["F"], self.warmup["CR"],
             int(self.warmup_frac * self.budget), self.n_checkpoints,
             seed=int(self._seed_rng.integers(0, 2**31 - 1)),
+            whiten=((np.diag(1.0 / self._domain_half), self._domain_center)
+                    if self._freedompp else None),
         )
 
         self._fes_used = warm.fes_used
@@ -217,6 +252,49 @@ class DEEnv:
         # First observation: the warm-up is the "segment that just finished".
         # Its incumbent-at-start is its own initial random-population best, so
         # B1 reflects how much the warm-up improved on random sampling.
+        if self._freedompp:
+            b5, b7 = self._shape_stats(warm.final_population,
+                                       self._domain_eff_radius)
+            fp_ctx = {
+                "trajectory": warm.trajectory,
+                "initial_best_fitness": warm.initial_best_fitness,
+                "incumbent_error_start": self._error(warm.initial_best_fitness),
+                "segment_best_error": self._global_best_error,
+                "improved_flag": 1.0 if self._global_best_error
+                                 < self._error(warm.initial_best_fitness) else 0.0,
+                "n_stag": 0,
+                "global_best_error": self._global_best_error,
+                # warm-up region = the whole domain (axis, diagonal frame).
+                "region_L_inv": np.diag(1.0 / self._domain_half),
+                "region_center": self._domain_center,
+                "segment_best_solution": warm.best_solution,
+                "b5_contraction": b5,
+                "b7_anisotropy": b7,
+                "c4_box_frac": 1.0,
+                "budget_remaining_frac": (self.budget - self._fes_used)
+                / self.budget,
+                "n_steps_taken": 0,
+                "prev_strategy_index": self._strategy_index.get(
+                    self.warmup["strategy"]),
+                "prev_F": self.warmup["F"],
+                "prev_CR": self.warmup["CR"],
+                "prev_budget_frac": self.warmup_frac,
+                "prev_box_scale_norm": 0.0,
+                "prev_np_norm": self.action.np_norm(self.pop_size),
+                "prev_elite_norm": 0.0,
+                # warm-up used no agent action -> all-zeros one-hots.
+                "prev_sampling_rule_index": None,
+                "prev_box_shape_index": None,
+                "prev_box_center_index": None,
+            }
+            obs = self.observation.build(fp_ctx)
+            info = {
+                "function_id": function_id,
+                "best_error": self._global_best_error,
+                "fes_used": self._fes_used,
+            }
+            return obs, info
+
         ctx = {
             "trajectory": warm.trajectory,
             "initial_best_fitness": warm.initial_best_fitness,
@@ -255,6 +333,8 @@ class DEEnv:
 
     # ---------------------------------------------------------------- step
     def step(self, action):
+        if self._freedompp:
+            return self._step_freedompp(action)
         from derl2.optimizers import run_segment
         self._t += 1
         decoded = self.action.decode(action)
@@ -423,4 +503,172 @@ class DEEnv:
         # Budget exhaustion is terminal, not a time-limit truncation, so
         # truncated is always False (the "truncate" in the config names the
         # segment-budget clamp, a different thing).
+        return next_obs, reward, terminated, False, info
+
+    # ------------------------------------------------------- step (freedom++)
+    def _step_freedompp(self, action):
+        """One freedom++ segment (EXP021/EXP022). The agent picks strategy,
+        box_center, box_shape and sampling_rule (four discrete heads) plus F, CR,
+        budget_frac, box_scale, NP and elite_carryover. The next population is the
+        best `elite_carryover*NP` of the previous population carried over verbatim
+        plus a `sampling_rule` fill of the chosen region (axis box or covariance
+        ellipsoid, both x=center+L z over the reference cube); the whole NP is
+        re-evaluated. All shape-aware observation features share the region's L."""
+        from derl2.optimizers import run_segment
+        self._t += 1
+        decoded = self.action.decode(action)
+
+        box_scale = float(decoded["box_scale"])
+        _blo, _bhi = self.action.ranges[3]
+        prev_box_scale_norm = (box_scale - _blo) / (_bhi - _blo + 1e-12)
+        box_center = decoded["box_center"]
+        box_shape = decoded["box_shape"]
+        sampling_rule = decoded["sampling_rule"]
+
+        prev_pop = np.asarray(self._prev_segment.final_population, dtype=np.float64)
+        prev_fit = np.asarray(self._prev_segment.final_fitness, dtype=np.float64)
+
+        # Region factor L (axis diag / covariance Cholesky) about the chosen
+        # center; L_inv is the shared whitening frame for the observation.
+        frame = build_frame(
+            box_shape, prev_pop, box_scale, self.box_min_frac,
+            self._domain_lo, self._domain_hi, box_center,
+            self._global_best_solution, rng=self._seed_rng)
+
+        fes_before = self._fes_used
+        remaining = self.budget - fes_before
+        requested = int(round(decoded["budget_frac"] * self.budget))
+        if requested <= remaining:
+            fe_budget = requested
+        elif self.truncate_last_segment:
+            fe_budget = remaining
+        else:
+            fe_budget = requested
+        seg_pop_size = min(int(decoded["pop_size"]), fe_budget)
+
+        # Elite carryover: best k of the previous population verbatim; the rest
+        # rule-filled from the region. Whole NP re-evaluated at gen 0 (no partial
+        # eval), so FE accounting is unchanged.
+        elite_frac = float(decoded["elite_carryover"])
+        k = max(0, min(int(round(elite_frac * seg_pop_size)),
+                       seg_pop_size, prev_pop.shape[0]))
+        fill = seg_pop_size - k
+        parts = []
+        if k > 0:
+            parts.append(prev_pop[np.argsort(prev_fit)[:k]])
+        if fill > 0:
+            parts.append(sample_from_box(
+                sampling_rule, frame.L, frame.center, fill,
+                self._domain_lo, self._domain_hi, self._seed_rng,
+                index_offset=self._halton_offset))
+            self._halton_offset += fill
+        init_population = np.concatenate(parts, axis=0).astype(np.float32)
+
+        seg = run_segment(
+            self._objective, self.dim, seg_pop_size,
+            frame.box_lo, frame.box_hi, self._domain_lo, self._domain_hi,
+            decoded["strategy"], decoded["F"], decoded["CR"],
+            fe_budget, self.n_checkpoints,
+            seed=int(self._seed_rng.integers(0, 2**31 - 1)),
+            init_population=init_population,
+            whiten=(frame.L_inv, frame.center),
+        )
+        self._fes_used += seg.fes_used
+
+        segment_best_error = self._error(seg.best_fitness)
+        error_best_before = self._global_best_error
+        n_stag_before = self._n_stag
+        improved = segment_best_error < error_best_before
+        if improved:
+            self._global_best_error = segment_best_error
+            self._global_best_solution = seg.best_solution
+            self._n_stag = 0
+        else:
+            self._n_stag = n_stag_before + 1
+        error_new = self._global_best_error
+
+        reward = self.reward_fn({
+            "t": self._t,
+            "error_best": error_best_before,
+            "error_new": error_new,
+            "n_stag": n_stag_before,
+            "function_id": self.function_id,
+        })
+        tau = seg.fes_used / (self.tau_frac * self.budget)
+        terminated = (self.budget - self._fes_used) < self._np_min
+        budget_remaining_frac = max(0.0,
+                                    (self.budget - self._fes_used) / self.budget)
+
+        b5, b7 = self._shape_stats(seg.final_population, frame.eff_radius)
+        c4_box_frac = frame.eff_radius / (self._domain_eff_radius + 1e-12)
+
+        ctx = {
+            "trajectory": seg.trajectory,
+            "initial_best_fitness": seg.initial_best_fitness,
+            "incumbent_error_start": error_best_before,
+            "segment_best_error": segment_best_error,
+            "improved_flag": 1.0 if improved else 0.0,
+            "n_stag": self._n_stag,
+            "global_best_error": self._global_best_error,
+            "region_L_inv": frame.L_inv,
+            "region_center": frame.center,
+            "segment_best_solution": seg.best_solution,
+            "b5_contraction": b5,
+            "b7_anisotropy": b7,
+            "c4_box_frac": c4_box_frac,
+            "budget_remaining_frac": budget_remaining_frac,
+            "n_steps_taken": self._t,
+            "prev_strategy_index": self._strategy_index.get(decoded["strategy"]),
+            "prev_F": decoded["F"],
+            "prev_CR": decoded["CR"],
+            "prev_budget_frac": decoded["budget_frac"],
+            "prev_box_scale_norm": prev_box_scale_norm,
+            "prev_np_norm": self.action.np_norm(seg_pop_size),
+            "prev_elite_norm": self.action.elite_norm(elite_frac),
+            "prev_sampling_rule_index": self.action.sampling_rules.index(
+                sampling_rule),
+            "prev_box_shape_index": self.action.box_shapes.index(box_shape),
+            "prev_box_center_index": self.action.box_centers.index(box_center),
+        }
+        next_obs = self.observation.build(ctx)
+
+        self._prev_segment = seg
+        self._box_lo, self._box_hi = frame.box_lo, frame.box_hi
+
+        info = {
+            "function_id": self.function_id,
+            "step_idx": self._t,
+            "tau": tau,
+            "budget_used_before": fes_before,
+            "budget_remaining_frac_before": (self.budget - fes_before)
+            / self.budget,
+            "fes_used_segment": seg.fes_used,
+            "fes_used_total": self._fes_used,
+            "strategy": decoded["strategy"],
+            "box_center": box_center,
+            "pop_size_action": seg_pop_size,
+            "F": decoded["F"],
+            "CR": decoded["CR"],
+            "budget_frac_action": decoded["budget_frac"],
+            "sampling_box_action": box_scale,
+            "box_width_frac_initial": self._width_frac(frame.box_lo, frame.box_hi),
+            "box_width_frac_final": self._width_frac(seg.final_box_lo,
+                                                     seg.final_box_hi),
+            "box_at_floor": frame.box_at_floor,
+            "incumbent_in_box": frame.incumbent_in_box,
+            "n_stag_before": n_stag_before,
+            "n_stag_after": self._n_stag,
+            "segment_best_error": segment_best_error,
+            "global_best_error_before": error_best_before,
+            "global_best_error_after": self._global_best_error,
+            "reward": reward,
+            "done": terminated,
+            "best_error": self._global_best_error,
+            "trajectory": seg.trajectory,
+            # freedom++ extras (not in STEP_COLUMNS; carried for future logging).
+            "box_shape": box_shape,
+            "sampling_rule": sampling_rule,
+            "elite_carryover": elite_frac,
+            "elites_carried": k,
+        }
         return next_obs, reward, terminated, False, info

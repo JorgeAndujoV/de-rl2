@@ -83,7 +83,13 @@ class HybridPPORNNAgent:
                 f"agent.cell only supports 'gru' currently, got {cell!r}.")
         tf.random.set_seed(seed)
         self.obs_dim = int(obs_dim)
-        self.n_actions = int(n_actions)          # K discrete actions
+        # Scalar K (single head) or list of head sizes (freedom++ multi-head:
+        # [strategy, box_center, box_shape, sampling_rule]).
+        self.multihead = isinstance(n_actions, (list, tuple))
+        self.discrete_dims = ([int(x) for x in n_actions] if self.multihead
+                              else [int(n_actions)])
+        self.n_disc = int(sum(self.discrete_dims))
+        self.n_actions = None if self.multihead else int(n_actions)
         self.param_dim = int(param_dim)
         self.per_budget = (discounting == "per_budget")
         self.gamma = gamma
@@ -98,12 +104,14 @@ class HybridPPORNNAgent:
         self.n_envs = n_envs
         self.rnn_hidden = int(rnn_hidden)
 
-        K, pd, H = self.n_actions, self.param_dim, self.rnn_hidden
+        pd, H = self.param_dim, self.rnn_hidden
         head_hidden = list(head_hidden)
-        # Separate recurrent trunks + heads for policy and value.
+        # Separate recurrent trunks + heads for policy and value. Policy head
+        # emits n_disc discrete logits (sum of head sizes; = K single-head) then
+        # 2*pd Beta parameters.
         self.pi_gru = tf.keras.layers.GRU(
             H, return_sequences=True, return_state=True, name="pi_gru")
-        self.pi_head = _head(H, head_hidden, K + 2 * pd)
+        self.pi_head = _head(H, head_hidden, self.n_disc + 2 * pd)
         self.v_gru = tf.keras.layers.GRU(
             H, return_sequences=True, return_state=True, name="v_gru")
         self.v_head = _head(H, head_hidden, 1)
@@ -127,14 +135,14 @@ class HybridPPORNNAgent:
     # ------------------------------------------------- single-step forward pass
     @tf.function(reduce_retracing=True)
     def _pi_step(self, obs1, h):
-        """obs1 (1,1,D), h (1,H) -> (logits (1,K), alpha (1,pd), beta (1,pd),
-        h_new (1,H))."""
+        """obs1 (1,1,D), h (1,H) -> (logits_all (1,n_disc), alpha (1,pd),
+        beta (1,pd), h_new (1,H)). Callers split logits_all per head."""
         seq, h_new = self.pi_gru(obs1, initial_state=h)
-        out = self.pi_head(seq)[:, 0, :]          # (1, K+2pd)
-        K, pd = self.n_actions, self.param_dim
-        logits = out[:, :K]
-        ab = tf.nn.softplus(tf.reshape(out[:, K:], (-1, pd, 2))) + 1.0
-        return logits, ab[:, :, 0], ab[:, :, 1], h_new
+        out = self.pi_head(seq)[:, 0, :]          # (1, n_disc+2pd)
+        pd = self.param_dim
+        logits_all = out[:, :self.n_disc]
+        ab = tf.nn.softplus(tf.reshape(out[:, self.n_disc:], (-1, pd, 2))) + 1.0
+        return logits_all, ab[:, :, 0], ab[:, :, 1], h_new
 
     @tf.function(reduce_retracing=True)
     def _v_step(self, obs1, h):
@@ -144,10 +152,34 @@ class HybridPPORNNAgent:
         return v, h_new
 
     # --------------------------------------------------------- distribution math
-    def _logprob(self, logits, alpha, beta, k, params):
+    def _cat_logprob(self, logits_all, k):
+        """Sum of categorical log-probs over any leading (...,) shape. Single
+        head: logits_all (...,K), k (...). Multi-head: logits_all (...,n_disc)
+        split by head, k (..., n_heads) summed over heads."""
+        if self.multihead:
+            total = 0.0
+            for h, lg in enumerate(tf.split(logits_all, self.discrete_dims,
+                                            axis=-1)):
+                total += tf.reduce_sum(
+                    tf.nn.log_softmax(lg)
+                    * tf.one_hot(k[..., h], self.discrete_dims[h]), axis=-1)
+            return total
+        return tf.reduce_sum(
+            tf.nn.log_softmax(logits_all) * tf.one_hot(k, self.n_actions),
+            axis=-1)
+
+    def _cat_entropy(self, logits_all):
+        def one(lg):
+            lp = tf.nn.log_softmax(lg)
+            return -tf.reduce_sum(tf.exp(lp) * lp, axis=-1)
+        if self.multihead:
+            return tf.add_n([one(lg) for lg in
+                             tf.split(logits_all, self.discrete_dims, axis=-1)])
+        return one(logits_all)
+
+    def _logprob(self, logits_all, alpha, beta, k, params):
         """All args carry a leading (...,) batch/time shape; returns that shape."""
-        logp_cat = tf.reduce_sum(
-            tf.nn.log_softmax(logits) * tf.one_hot(k, self.n_actions), axis=-1)
+        logp_cat = self._cat_logprob(logits_all, k)
         x = tf.clip_by_value(params, _LOGPROB_EPS, 1.0 - _LOGPROB_EPS)
         logB = (tf.math.lgamma(alpha) + tf.math.lgamma(beta)
                 - tf.math.lgamma(alpha + beta))
@@ -155,9 +187,8 @@ class HybridPPORNNAgent:
             + (beta - 1.0) * tf.math.log(1.0 - x) - logB
         return logp_cat + tf.reduce_sum(logp_beta, axis=-1)
 
-    def _entropy(self, logits, alpha, beta):
-        logp = tf.nn.log_softmax(logits)
-        cat_ent = -tf.reduce_sum(tf.exp(logp) * logp, axis=-1)
+    def _entropy(self, logits_all, alpha, beta):
+        cat_ent = self._cat_entropy(logits_all)
         logB = (tf.math.lgamma(alpha) + tf.math.lgamma(beta)
                 - tf.math.lgamma(alpha + beta))
         beta_ent = (logB - (alpha - 1.0) * tf.math.digamma(alpha)
@@ -171,28 +202,45 @@ class HybridPPORNNAgent:
         Returns ((k, params), logprob, value, new_state)."""
         h_pi, h_v = state
         o = tf.constant(np.asarray(obs, dtype=np.float32)[None, None, :])
-        logits, alpha, beta, h_pi2 = self._pi_step(
+        logits_all, alpha, beta, h_pi2 = self._pi_step(
             o, tf.constant(h_pi[None, :]))
-        p = tf.nn.softmax(logits)[0].numpy().astype(np.float64)
-        p = p / p.sum()
-        k = int(self.rng.choice(self.n_actions, p=p))
         a = alpha[0].numpy(); b = beta[0].numpy()
         params = self.rng.beta(a, b).astype(np.float32)
+        la = logits_all[0].numpy().astype(np.float64)
+        if self.multihead:
+            k = np.empty(len(self.discrete_dims), dtype=np.int64)
+            off = 0
+            for hh, dh in enumerate(self.discrete_dims):
+                seg = la[off:off + dh]
+                e = np.exp(seg - seg.max()); p = e / e.sum()
+                k[hh] = int(self.rng.choice(dh, p=p)); off += dh
+            k_tf = tf.constant(k[None, :]); k_out = k
+        else:
+            e = np.exp(la - la.max()); p = e / e.sum()
+            k_out = int(self.rng.choice(self.n_actions, p=p))
+            k_tf = tf.constant([k_out])
         logp = float(self._logprob(
-            logits, alpha, beta,
-            tf.constant([k]), tf.constant(params[None, :]))[0].numpy())
+            logits_all, alpha, beta,
+            k_tf, tf.constant(params[None, :]))[0].numpy())
         v, h_v2 = self._v_step(o, tf.constant(h_v[None, :]))
         new_state = (h_pi2[0].numpy(), h_v2[0].numpy())
-        return (k, params), logp, float(v[0].numpy()), new_state
+        return (k_out, params), logp, float(v[0].numpy()), new_state
 
     def act_eval(self, obs, state):
         """Deterministic greedy action (argmax strategy, Beta means), threading
         the policy hidden state. Returns ((k, params), new_state)."""
         h_pi, h_v = state
         o = tf.constant(np.asarray(obs, dtype=np.float32)[None, None, :])
-        logits, alpha, beta, h_pi2 = self._pi_step(
+        logits_all, alpha, beta, h_pi2 = self._pi_step(
             o, tf.constant(h_pi[None, :]))
-        k = int(tf.argmax(logits[0]).numpy())
+        la = logits_all[0].numpy()
+        if self.multihead:
+            k = np.empty(len(self.discrete_dims), dtype=np.int64)
+            off = 0
+            for hh, dh in enumerate(self.discrete_dims):
+                k[hh] = int(np.argmax(la[off:off + dh])); off += dh
+        else:
+            k = int(np.argmax(la))
         params = (alpha / (alpha + beta))[0].numpy().astype(np.float32)
         return (k, params), (h_pi2[0].numpy(), h_v)
 
@@ -208,13 +256,13 @@ class HybridPPORNNAgent:
                                     initial_state=tf.zeros(
                                         (tf.shape(obs)[0], self.rnn_hidden)))
             out = self.pi_head(pi_seq)
-            K, pd = self.n_actions, self.param_dim
-            logits = out[:, :, :K]
-            ab = tf.nn.softplus(tf.reshape(out[:, :, K:],
+            pd = self.param_dim
+            logits_all = out[:, :, :self.n_disc]
+            ab = tf.nn.softplus(tf.reshape(out[:, :, self.n_disc:],
                                            (tf.shape(obs)[0], tf.shape(obs)[1],
                                             pd, 2))) + 1.0
             alpha, beta = ab[:, :, :, 0], ab[:, :, :, 1]
-            new_logp = self._logprob(logits, alpha, beta, k, params)
+            new_logp = self._logprob(logits_all, alpha, beta, k, params)
             ratio = tf.exp(new_logp - old_logp)
             surr1 = ratio * adv
             surr2 = tf.clip_by_value(ratio, 1.0 - self.clip, 1.0 + self.clip) * adv
@@ -229,7 +277,7 @@ class HybridPPORNNAgent:
                 ((value_pred - ret) ** 2) * mask) / denom
 
             entropy = tf.reduce_sum(
-                self._entropy(logits, alpha, beta) * mask) / denom
+                self._entropy(logits_all, alpha, beta) * mask) / denom
             loss = (policy_loss + self.value_coef * value_loss
                     - self.entropy_coef * entropy)
         variables = (self.pi_gru.trainable_variables
@@ -269,7 +317,11 @@ class HybridPPORNNAgent:
             t = len(ep["k"])
             obs = np.zeros((T, self.obs_dim), np.float32)
             obs[:t] = ep["obs"]
-            k = np.zeros(T, np.int32); k[:t] = ep["k"]
+            kk = np.asarray(ep["k"])
+            if kk.ndim == 1:                          # single head: (T,)
+                k = np.zeros(T, np.int32); k[:t] = kk
+            else:                                     # multi-head: (T, n_heads)
+                k = np.zeros((T, kk.shape[1]), np.int32); k[:t] = kk
             par = np.zeros((T, pd), np.float32); par[:t] = ep["params"]
             olp = np.zeros(T, np.float32); olp[:t] = ep["old_logp"]
             adv = np.zeros(T, np.float32)

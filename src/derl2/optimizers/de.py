@@ -60,7 +60,8 @@ class _SegmentDE:
     """
 
     def __init__(self, objective, dim, pop_size, box_lo, box_hi,
-                 domain_lo, domain_hi, strategy, seed, cov=None):
+                 domain_lo, domain_hi, strategy, seed, cov=None,
+                 init_population=None):
         self.objective = objective
         self.dim = dim
         self.pop_size = pop_size
@@ -77,6 +78,11 @@ class _SegmentDE:
             center, chol = cov
             self.cov = (tf.constant(center, dtype=tf.float32),
                         tf.constant(chol, dtype=tf.float32))
+        # freedom++ (EXP021+): the caller may supply the whole initial population
+        # verbatim (elite carryover + a rule-filled sample from the region). When
+        # given it is used as-is and box_lo/box_hi/cov are ignored for the draw.
+        self.init_population = (np.asarray(init_population, dtype=np.float32)
+                                if init_population is not None else None)
         self.strategy = build_strategy(strategy)
 
         self._default_strategy_name = strategy
@@ -118,7 +124,11 @@ class _SegmentDE:
         to the validated behaviour (see module docstring)."""
         if seed is not None:
             self.gen.reset_from_seed(seed)
-        if self.cov is None:
+        if self.init_population is not None:
+            # freedom++: caller-provided population (elites + rule-filled sample),
+            # already domain-clipped by the sampler. Used verbatim.
+            init = tf.constant(self.init_population, dtype=tf.float32)
+        elif self.cov is None:
             init = self.gen.uniform(
                 (self.pop_size, self.dim),
                 minval=self.box_lo, maxval=self.box_hi, dtype=tf.float32,
@@ -231,13 +241,24 @@ class _SegmentDE:
 
 
 def run_segment(objective, dim, pop_size, box_lo, box_hi, domain_lo, domain_hi,
-                strategy, F, CR, fe_budget, n_checkpoints, seed, cov=None):
+                strategy, F, CR, fe_budget, n_checkpoints, seed, cov=None,
+                init_population=None, whiten=None):
     """Run one DE segment and return a SegmentResult.
 
     The initial population evaluation costs `pop_size` FEs and each generation
     costs another `pop_size`, so the number of affordable generations is
     `fe_budget // pop_size - 1` and the segment consumes the largest multiple
     of `pop_size` that fits within `fe_budget`.
+
+    init_population : (pop_size, dim) freedom++ initial population, used verbatim
+                     when given (elites + rule-filled sample); box_lo/box_hi/cov
+                     then only describe the region for logging.
+    whiten         : (L_inv, center) freedom++ whitening frame. When given,
+                     trajectory channel 0 becomes the population's RMS whitened
+                     spread `sqrt(mean ||L_inv (x - center)||^2 / D)` (measured in
+                     the chosen region's coordinates) instead of the axis-aligned
+                     mean box-width fraction. Diagonal L_inv reproduces the same
+                     per-dimension normalized spread the axis path reports.
     """
     box_lo = np.asarray(box_lo, dtype=np.float32)
     box_hi = np.asarray(box_hi, dtype=np.float32)
@@ -246,12 +267,20 @@ def run_segment(objective, dim, pop_size, box_lo, box_hi, domain_lo, domain_hi,
     domain_width = domain_hi - domain_lo
 
     de = _SegmentDE(objective, dim, pop_size, box_lo, box_hi,
-                    domain_lo, domain_hi, strategy, seed, cov=cov)
+                    domain_lo, domain_hi, strategy, seed, cov=cov,
+                    init_population=init_population)
+
+    if whiten is not None:
+        _L_inv = np.asarray(whiten[0], dtype=np.float64)
+        _center = np.asarray(whiten[1], dtype=np.float64)
 
     def box_width_frac():
         pop = de.population.numpy()
-        widths = pop.max(axis=0) - pop.min(axis=0)
-        return float(np.mean(widths / domain_width))
+        if whiten is None:
+            widths = pop.max(axis=0) - pop.min(axis=0)
+            return float(np.mean(widths / domain_width))
+        w = (pop.astype(np.float64) - _center) @ _L_inv.T     # whitened coords
+        return float(np.sqrt(np.mean(w ** 2)))
 
     K = n_checkpoints
     generations = max(0, fe_budget // pop_size - 1)

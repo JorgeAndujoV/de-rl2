@@ -1,0 +1,96 @@
+experiment: EXP021_hybridppo_freedompp
+seed: 0
+
+# EXP021: "freedom++" -- EXP016 (Hybrid PPO, boxnp) with a much richer action
+# space AND a shape-aware observation. The agent now also chooses, per restart:
+#   - elite_carryover in [0, 0.3]: fraction of NP carried verbatim (best-first)
+#     from the previous population into the next segment (whole NP re-evaluated);
+#   - box_shape {axis, covariance}: axis-aligned box vs population-covariance
+#     ellipsoid (one code path: x = center + L z over the reference cube, L
+#     diagonal for axis, Cholesky of the regularized covariance for covariance);
+#   - sampling_rule {uniform, halton, opposition}: how the non-elite members fill
+#     the region.
+# The four discrete choices (strategy, box_center, box_shape, sampling_rule) are
+# FACTORED into separate categorical heads (not a joint index). The observation
+# (traj20_freedompp, 109 dims) adds the previous elite/rule/shape/center, and
+# generalizes A1/B4/B5/C4 to the region's whitening frame (Mahalanobis /
+# effective radius) plus B7 = log10(cond) population anisotropy. 15k episodes.
+
+benchmark:
+  name: cec13
+  functions: [2, 6, 11, 12, 17, 3, 7, 15, 10, 16, 22]
+  dim: 30
+  budget: 300000
+
+episode:
+  pop_size: 50                 # warm-up NP (fixed); agent sets NP per segment
+  warmup_frac: 0.05
+  warmup: {strategy: rand/1/bin, F: 0.5, CR: 0.9}
+  box_center: centroid         # fallback; the agent chooses per segment
+  box_scales: [1.0]
+  box_min_frac: 0.0417
+  elitism: false               # (env-level incumbent injection; unrelated to the
+                               #  agent's elite_carryover action)
+  truncate_last_segment: true
+
+environment:
+  observation: traj20_freedompp
+  n_checkpoints: 20
+  action_space: param_strategy_freedompp
+  f_range: [0.0, 1.0]
+  cr_range: [0.0, 1.0]
+  budget_range: [0.05, 0.95]
+  box_scale_range: [0.25, 3.0]
+  np_range: [16, 400]
+  box_centers: [centroid, incumbent, random]
+  elite_range: [0.0, 0.3]
+  box_shapes: [axis, covariance]
+  sampling_rules: [uniform, halton, opposition]
+  strategy_profiles:
+    - {strategy: rand/1/bin}
+    - {strategy: best/1/bin}
+    - {strategy: current-to-best/1/bin}
+    - {strategy: rand/2/bin}
+    - {strategy: current-to-pbest/1/bin}
+  reward: {name: log_stagnation, lambda: 0.1, tau_stag: 3}
+
+agent:
+  name: hybrid_ppo             # multi-head build (Stage 2): 4 discrete heads
+  param_dim: 6                 # F, CR, budget_frac, box_scale, NP, elite_carryover
+  discounting: per_budget
+  gamma: 0.99
+  gae_lambda: 0.95
+  lr: 3.0e-4
+  policy_hidden: [128, 128]
+  value_hidden: [128, 128]
+  clip: 0.2
+  epochs: 10
+  minibatch_size: 64
+  entropy_coef: 0.01
+  value_coef: 0.5
+  max_grad_norm: 0.5
+  rollout_steps: 512
+  n_envs: 8
+
+training:
+  episodes: 15000
+  eval_every: 2000
+  eval_episodes: 10
+  checkpoint_every: 2000
+  periodic_eval: {start: 1000, every: 1000}
+
+evaluation:
+  runs_per_function: 51
+  seed_offset: 900000
+  save_trajectory_seeds: 3
+  # Own baseline set: the freedom++ random baseline samples the full multi-head +
+  # elite/rule/shape space, so it differs from every earlier space.
+  baseline_namespace: BASE_FREEDOMPP
+  compare_against: [BASE001_de_plain, BASE003_random]
+
+slurm:
+  time: "5-00:00:00"
+  mem: "16G"
+  cpus: 8
+  gpus: 0
+  account: def-bolufe

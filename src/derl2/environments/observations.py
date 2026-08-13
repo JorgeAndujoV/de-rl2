@@ -237,12 +237,106 @@ class Traj20ContBoxNP(Traj20ContBox):
         return np.concatenate([block_ab, block_c]).astype(np.float32)
 
 
+class Traj20FreedomPP(Traj20):
+    """freedom++ observation (EXP021/EXP022): traj20 generalized to a
+    shape-aware sampling region (axis box OR covariance ellipsoid) and the
+    freedom++ action space (elite carryover, sampling rule, box shape).
+
+    Shape-aware generalizations (all reduce to the traj20 formulas when the
+    region factor L is diagonal, i.e. box_shape=axis):
+      * A1[k] = the population's RMS WHITENED spread at checkpoint k, measured in
+        the region's own coordinates. Computed by the optimizer (de.run_segment's
+        `whiten=(L^-1, center)`), so it arrives already in trajectory channel 0;
+        this class just reads it like traj20 reads box_width.
+      * B4 = Mahalanobis displacement of the segment best from the region center,
+        sqrt((1/D) * ||L^-1 (x_best - center)||^2), clipped [0,10]. Diagonal L^-1
+        reproduces traj20's RMS per-axis displacement.
+      * B5 = effective-radius contraction det(Sigma_final)^(1/2D) /
+        det(Sigma_box)^(1/2D) (the env passes it as `b5_contraction`).
+      * C4 = the region's effective-radius fraction of the domain
+        (env passes `c4_box_frac`).
+    New feature:
+      * B7 = log10(condition number of the final population covariance), clipped
+        [0,8] -- the anisotropy signal for the box_shape decision (0 = spherical,
+        large = elongated/rotated, where a covariance box helps).
+
+    Block C carries the full previous freedom++ action: strategy one-hot(5),
+    F/CR/budget, box_scale_norm, NP_norm, elite_carryover_norm, and one-hots for
+    sampling_rule(3), box_shape(2) and box_center(3).
+
+    dim = 80 (Block A) + 7 (Block B, +B7) + 22 (Block C) = 109.
+    """
+
+    name = "traj20_freedompp"
+    N_STRATEGIES = 5
+    N_RULES = 3
+    N_SHAPES = 2
+    N_CENTERS = 3
+    dim = (4 * Traj20.K + 7
+           + (2 + N_STRATEGIES + 6 + N_RULES + N_SHAPES + N_CENTERS + 1))  # 109
+
+    def build(self, ctx):
+        # ---- Block A (80): trajectory, channel-major (channel 0 is the whitened
+        # spread the optimizer recorded when given the region's L^-1). ----
+        traj = np.asarray(ctx["trajectory"], dtype=np.float64)
+        if traj.shape != (self.K, 5):
+            raise ValueError(
+                f"traj20_freedompp expects a ({self.K}, 5) trajectory; "
+                f"got {traj.shape}.")
+        spread = traj[:, 0]
+        success = traj[:, 1]
+        best = traj[:, 2]
+        mean = traj[:, 3]
+        prev_best = np.concatenate(([ctx["initial_best_fitness"]], best[:-1]))
+        a3 = np.log10(1.0 + np.maximum(prev_best - best, 0.0))
+        a4 = np.log10(1.0 + np.maximum(mean - best, 0.0))
+        block_a = np.concatenate([spread, success, a3, a4]).astype(np.float32)
+
+        # ---- Block B (7) ----
+        inc_start = ctx["incumbent_error_start"]
+        seg_best = ctx["segment_best_error"]
+        b1 = float(np.clip(
+            np.log10((inc_start + ERR_EPS) / (seg_best + ERR_EPS)), -8.0, 8.0))
+        b2 = float(ctx["improved_flag"])
+        b3 = min(ctx["n_stag"] / 5.0, 1.0)
+        # B4: Mahalanobis displacement in the region's whitened frame.
+        L_inv = np.asarray(ctx["region_L_inv"], dtype=np.float64)
+        center = np.asarray(ctx["region_center"], dtype=np.float64)
+        x_best = np.asarray(ctx["segment_best_solution"], dtype=np.float64)
+        w = L_inv @ (x_best - center)
+        b4 = float(np.clip(np.sqrt(np.mean(w ** 2)), 0.0, 10.0))
+        b5 = float(ctx["b5_contraction"])
+        b6 = float(np.log10(ctx["global_best_error"] + 1e-12))
+        b7 = float(np.clip(ctx["b7_anisotropy"], 0.0, 8.0))
+        block_b = np.array([b1, b2, b3, b4, b5, b6, b7], dtype=np.float32)
+
+        # ---- Block C (22) ----
+        block_c = np.concatenate([
+            np.array([ctx["budget_remaining_frac"]], dtype=np.float32),       # C1
+            np.array([ctx["n_steps_taken"] / 19.0], dtype=np.float32),        # C2
+            _one_hot(ctx["prev_strategy_index"], self.N_STRATEGIES),          # C3a
+            np.array([ctx["prev_F"]], dtype=np.float32),                      # C3b
+            np.array([ctx["prev_CR"]], dtype=np.float32),                     # C3c
+            np.array([ctx["prev_budget_frac"]], dtype=np.float32),            # C3d
+            np.array([ctx["prev_box_scale_norm"]], dtype=np.float32),         # C3e
+            np.array([ctx["prev_np_norm"]], dtype=np.float32),                # C3f
+            np.array([ctx["prev_elite_norm"]], dtype=np.float32),             # C3g
+            _one_hot(ctx["prev_sampling_rule_index"], self.N_RULES),          # C3h
+            _one_hot(ctx["prev_box_shape_index"], self.N_SHAPES),             # C3i
+            _one_hot(ctx["prev_box_center_index"], self.N_CENTERS),           # C3j
+            np.array([ctx["c4_box_frac"]], dtype=np.float32),                 # C4
+        ]).astype(np.float32)
+
+        return np.concatenate([block_a, block_b, block_c]).astype(np.float32)
+
+
 # --------------------------------------------------------------- registry
 
 OBSERVATIONS = {
     "traj20": Traj20,
     "traj20_contbox": Traj20ContBox,
     "traj20_contboxnp": Traj20ContBoxNP,
+    "traj20_freedompp": Traj20FreedomPP,
 }
 
 

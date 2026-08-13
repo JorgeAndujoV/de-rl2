@@ -20,6 +20,178 @@ from dataclasses import dataclass
 
 import numpy as np
 
+# --------------------------------------------------------------------------- #
+# freedom++ geometry (EXP021/EXP022): a UNIFIED sampling region for both the
+# axis-aligned and covariance shapes, plus low-discrepancy / opposition fills.
+#
+# The whole idea (see the EXP021 design): a region is a linear map of the
+# reference cube z in [-1, 1]^D,
+#
+#       x = center + L @ z
+#
+# where L is a lower-triangular Cholesky-style factor. `axis` is simply the
+# DIAGONAL-L special case (L = diag(half_width)); `covariance` is the full
+# Cholesky of the regularized population covariance. So one sampler handles both
+# shapes, one whitening L^-1 handles every shape-aware observation feature, and
+# the axis case is a genuine special case, not a separate code branch.
+# --------------------------------------------------------------------------- #
+
+# First 64 primes: Halton base for dimension d is _PRIMES[d]. CEC'13 runs at
+# D=30 (base up to 113); the list is long enough for any D we use.
+_PRIMES = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61,
+           67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137,
+           139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193, 197, 199,
+           211, 223, 227, 229, 233, 239, 241, 251, 257, 263, 269, 271, 277,
+           281, 283, 293, 307, 311]
+
+
+def _halton_vec(indices, base):
+    """Radical inverse of each index in `base` -> values in [0, 1). Vectorized
+    over `indices` (a 1-D int array). index 0 maps to 0.0, so callers start at 1."""
+    idx = np.asarray(indices, dtype=np.int64).copy()
+    result = np.zeros(idx.shape, dtype=np.float64)
+    f = 1.0
+    while np.any(idx > 0):
+        f /= base
+        result += f * (idx % base)
+        idx //= base
+    return result
+
+
+@dataclass
+class FreedomBox:
+    """A freedom++ sampling region, parameterized by the linear map x=center+L z.
+
+    Reduces to an axis-aligned box exactly when L is diagonal. `L_inv` is the
+    whitening map the shape-aware observation features share (A1, B4, B5, C4);
+    `eff_radius` = det(L)^(1/D) is the volume-based "radius" B5/C4 use;
+    box_lo/box_hi are the domain-clipped bounding box of the cube image (for
+    logging and incumbent containment)."""
+
+    center: np.ndarray          # (D,)
+    L: np.ndarray               # (D,D) lower-triangular factor (diagonal if axis)
+    L_inv: np.ndarray           # (D,D) whitening map = inv(L)
+    box_lo: np.ndarray          # (D,) domain-clipped bounding box lower
+    box_hi: np.ndarray          # (D,) domain-clipped bounding box upper
+    eff_radius: float           # det(L)^(1/D), the box's effective radius
+    box_at_floor: bool
+    incumbent_in_box: bool
+
+
+def _resolve_center(pop, domain_lo, domain_hi, box_center, incumbent, rng):
+    if box_center == "centroid":
+        return pop.mean(axis=0)
+    if box_center == "incumbent":
+        return incumbent.copy()
+    if box_center == "random":
+        if rng is None:
+            raise ValueError("box_center='random' requires an rng.")
+        return domain_lo + rng.random(domain_lo.shape) * (domain_hi - domain_lo)
+    raise ValueError(
+        f"box_center must be 'centroid', 'incumbent' or 'random', "
+        f"got {box_center!r}.")
+
+
+def build_frame(box_shape, final_population, scale, box_min_frac,
+                domain_lo, domain_hi, box_center, incumbent, rng=None):
+    """Build the freedom++ region factor L (and its inverse) for the next segment.
+
+    box_shape : 'axis' -> L = diag(half_width); 'covariance' -> L = chol(Sigma_reg).
+    scale     : the agent's box_scale; multiplies the region's half-width / std.
+    Everything is symmetric about `center` (the cube z in [-1,1]^D is symmetric),
+    so the axis case is exactly the current per-dimension rescaling with a
+    diagonal L, and opposition reflection x'=2c-x holds for any L.
+    """
+    pop = np.asarray(final_population, dtype=np.float64)
+    domain_lo = np.asarray(domain_lo, dtype=np.float64)
+    domain_hi = np.asarray(domain_hi, dtype=np.float64)
+    incumbent = np.asarray(incumbent, dtype=np.float64)
+    d = pop.shape[1]
+    domain_half = (domain_hi - domain_lo) / 2.0
+    floor = box_min_frac * domain_half                       # per-dim half-width floor
+
+    center = _resolve_center(pop, domain_lo, domain_hi, box_center, incumbent, rng)
+
+    if box_shape == "axis":
+        half_width = (pop.max(axis=0) - pop.min(axis=0)) / 2.0
+        scaled = scale * half_width
+        box_at_floor = bool(np.any(scaled < floor))
+        scaled = np.maximum(scaled, floor)
+        L = np.diag(scaled)
+    elif box_shape == "covariance":
+        sigma = (np.cov(pop, rowvar=False) if pop.shape[0] > 1
+                 else np.zeros((d, d)))
+        sigma = np.atleast_2d(sigma)
+        floor_var = floor ** 2
+        box_at_floor = bool(np.any(np.diag(sigma) < floor_var))
+        # Additive per-dim variance floor keeps Sigma_reg positive-definite
+        # (PSD + strictly-positive diagonal), so the Cholesky always succeeds.
+        sigma_reg = sigma + np.diag(floor_var)
+        L = scale * np.linalg.cholesky(sigma_reg)
+    else:
+        raise ValueError(
+            f"box_shape must be 'axis' or 'covariance', got {box_shape!r}.")
+
+    # Bounding box of the cube image {center + L z : z in [-1,1]^D}: per dim the
+    # reach is the L1 norm of that row of L (= |L_dd| = half_width for a diagonal
+    # L). Domain-clipped, for logging and incumbent containment only.
+    extent = np.sum(np.abs(L), axis=1)
+    box_lo = np.clip(center - extent, domain_lo, domain_hi)
+    box_hi = np.clip(center + extent, domain_lo, domain_hi)
+    incumbent_in_box = bool(np.all(incumbent >= box_lo)
+                            and np.all(incumbent <= box_hi))
+
+    # det(L)^(1/D): the box's effective radius (volume^(1/D)); reduces to the
+    # geometric-mean half-width when L is diagonal. |det| guards sign/round-off.
+    sign, logabsdet = np.linalg.slogdet(L)
+    eff_radius = float(np.exp(logabsdet / d)) if sign != 0 else 0.0
+
+    return FreedomBox(
+        center=center.astype(np.float64),
+        L=L.astype(np.float64),
+        L_inv=np.linalg.inv(L).astype(np.float64),
+        box_lo=box_lo.astype(np.float32),
+        box_hi=box_hi.astype(np.float32),
+        eff_radius=eff_radius,
+        box_at_floor=box_at_floor,
+        incumbent_in_box=incumbent_in_box,
+    )
+
+
+def sample_from_box(rule, L, center, n, domain_lo, domain_hi, rng,
+                    index_offset=0):
+    """Sample `n` points in the region x = center + L z, z filling [-1,1]^D by
+    `rule`, then clip to the domain. One implementation for both box shapes.
+
+    uniform     : z_d ~ U(-1, 1) i.i.d.
+    halton      : z_d = 2*halton(i, prime_d) - 1  (low-discrepancy; index_offset
+                  advances the sequence per restart so restarts differ).
+    opposition  : sample ceil(n/2) points and add their mirrors z -> -z, i.e.
+                  x' = center - L z = 2*center - x  (same FE count as uniform).
+    """
+    center = np.asarray(center, dtype=np.float64)
+    L = np.asarray(L, dtype=np.float64)
+    d = center.shape[0]
+    if rule == "uniform":
+        z = rng.uniform(-1.0, 1.0, size=(n, d))
+    elif rule == "halton":
+        idx = index_offset + np.arange(1, n + 1)             # skip index 0 (->0.0)
+        z = np.empty((n, d), dtype=np.float64)
+        for j in range(d):
+            z[:, j] = 2.0 * _halton_vec(idx, _PRIMES[j]) - 1.0
+    elif rule == "opposition":
+        m = (n + 1) // 2
+        zb = rng.uniform(-1.0, 1.0, size=(m, d))
+        z = np.concatenate([zb, -zb], axis=0)[:n]            # mirror pairs
+    else:
+        raise ValueError(
+            f"sampling_rule must be 'uniform', 'halton' or 'opposition', "
+            f"got {rule!r}.")
+    x = center[None, :] + z @ L.T
+    x = np.clip(x, np.asarray(domain_lo, dtype=np.float64),
+                np.asarray(domain_hi, dtype=np.float64))
+    return x.astype(np.float32)
+
 
 @dataclass
 class SamplingBox:

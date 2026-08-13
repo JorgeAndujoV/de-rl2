@@ -86,7 +86,15 @@ class HybridPPOAgent:
                 f"got {discounting!r}.")
         tf.random.set_seed(seed)
         self.obs_dim = obs_dim
-        self.n_actions = int(n_actions)          # K strategies
+        # n_actions is a scalar K for a single discrete head (the strategy /
+        # joint index of every earlier experiment) OR a list of head sizes for a
+        # MULTI-HEAD space (freedom++: [strategy, box_center, box_shape,
+        # sampling_rule]). Single-head keeps the exact original code path.
+        self.multihead = isinstance(n_actions, (list, tuple))
+        self.discrete_dims = ([int(x) for x in n_actions] if self.multihead
+                              else [int(n_actions)])
+        self.n_disc = int(sum(self.discrete_dims))
+        self.n_actions = None if self.multihead else int(n_actions)
         self.param_dim = int(param_dim)
         self.per_budget = (discounting == "per_budget")
         self.gamma = gamma
@@ -100,8 +108,10 @@ class HybridPPOAgent:
         self.rollout_steps = rollout_steps
         self.n_envs = n_envs
 
-        K, pd = self.n_actions, self.param_dim
-        self.policy_net = _mlp(obs_dim, list(policy_hidden), K + 2 * pd)
+        pd = self.param_dim
+        # Discrete logits (n_disc = sum of head sizes; = K for a single head)
+        # then 2*pd Beta parameters. Single-head keeps output size K + 2*pd.
+        self.policy_net = _mlp(obs_dim, list(policy_hidden), self.n_disc + 2 * pd)
         self.value_net = _mlp(obs_dim, list(value_hidden), 1)
         self.optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
 
@@ -110,16 +120,43 @@ class HybridPPOAgent:
 
     # --------------------------------------------------- policy distribution
     def _dist(self, obs):
-        """obs (B, D) -> (logits (B,K), alpha (B,pd), beta (B,pd))."""
-        K, pd = self.n_actions, self.param_dim
+        """obs (B, D) -> (logits, alpha (B,pd), beta (B,pd)). `logits` is (B,K)
+        for a single head, or a list of (B, dim_h) tensors for a multi-head
+        space (one categorical per discrete factor)."""
+        pd = self.param_dim
         out = self.policy_net(obs, training=False)
-        logits = out[:, :K]
-        ab = tf.nn.softplus(tf.reshape(out[:, K:], (-1, pd, 2))) + 1.0
-        return logits, ab[:, :, 0], ab[:, :, 1]
+        ab = tf.nn.softplus(tf.reshape(out[:, self.n_disc:], (-1, pd, 2))) + 1.0
+        if self.multihead:
+            logits, off = [], 0
+            for dh in self.discrete_dims:
+                logits.append(out[:, off:off + dh]); off += dh
+            return logits, ab[:, :, 0], ab[:, :, 1]
+        return out[:, :self.n_actions], ab[:, :, 0], ab[:, :, 1]
+
+    def _cat_logprob(self, logits, k):
+        """Sum of categorical log-probs: single head (logits (B,K), k (B,)) or
+        multi-head (logits a list, k (B, n_heads) -> summed over heads)."""
+        if self.multihead:
+            total = 0.0
+            for h, lg in enumerate(logits):
+                total += tf.reduce_sum(
+                    tf.nn.log_softmax(lg)
+                    * tf.one_hot(k[:, h], self.discrete_dims[h]), axis=1)
+            return total
+        return tf.reduce_sum(
+            tf.nn.log_softmax(logits) * tf.one_hot(k, self.n_actions), axis=1)
+
+    def _cat_entropy(self, logits):
+        """Sum of categorical entropies over heads (or the single head)."""
+        def one(lg):
+            lp = tf.nn.log_softmax(lg)
+            return -tf.reduce_sum(tf.exp(lp) * lp, axis=1)
+        if self.multihead:
+            return tf.add_n([one(lg) for lg in logits])
+        return one(logits)
 
     def _logprob(self, logits, alpha, beta, k, params):
-        logp_cat = tf.reduce_sum(
-            tf.nn.log_softmax(logits) * tf.one_hot(k, self.n_actions), axis=1)
+        logp_cat = self._cat_logprob(logits, k)
         x = tf.clip_by_value(params, _LOGPROB_EPS, 1.0 - _LOGPROB_EPS)
         logB = (tf.math.lgamma(alpha) + tf.math.lgamma(beta)
                 - tf.math.lgamma(alpha + beta))
@@ -128,8 +165,7 @@ class HybridPPOAgent:
         return logp_cat + tf.reduce_sum(logp_beta, axis=1)
 
     def _entropy(self, logits, alpha, beta):
-        logp = tf.nn.log_softmax(logits)
-        cat_ent = -tf.reduce_sum(tf.exp(logp) * logp, axis=1)
+        cat_ent = self._cat_entropy(logits)
         logB = (tf.math.lgamma(alpha) + tf.math.lgamma(beta)
                 - tf.math.lgamma(alpha + beta))
         beta_ent = (logB - (alpha - 1.0) * tf.math.digamma(alpha)
@@ -140,27 +176,40 @@ class HybridPPOAgent:
     # ------------------------------------------------------ collection / eval
     def act_collect(self, obs):
         """Sample an action from the current policy. Returns
-        ((k, params), logprob, value) — the on-policy loop stores all three."""
+        ((k, params), logprob, value) — the on-policy loop stores all three.
+        `k` is a scalar strategy index (single head) or a length-n_heads array of
+        per-head indices (multi-head); either is what the action space decodes."""
         o = tf.constant(np.asarray(obs)[None, :], dtype=tf.float32)
         logits, alpha, beta = self._dist(o)
-        p = tf.nn.softmax(logits)[0].numpy().astype(np.float64)
-        p = p / p.sum()                     # exact renorm (float softmax != 1.0)
-        k = int(self.rng.choice(self.n_actions, p=p))
         a = alpha[0].numpy()
         b = beta[0].numpy()
         params = self.rng.beta(a, b).astype(np.float32)
-        logp = float(self._logprob(logits, alpha, beta,
-                                   tf.constant([k]),
+        if self.multihead:
+            k = np.empty(len(self.discrete_dims), dtype=np.int64)
+            for h, lg in enumerate(logits):
+                p = tf.nn.softmax(lg)[0].numpy().astype(np.float64)
+                k[h] = int(self.rng.choice(self.discrete_dims[h], p=p / p.sum()))
+            k_tf = tf.constant(k[None, :])
+            k_out = k
+        else:
+            p = tf.nn.softmax(logits)[0].numpy().astype(np.float64)
+            k_out = int(self.rng.choice(self.n_actions, p=p / p.sum()))
+            k_tf = tf.constant([k_out])
+        logp = float(self._logprob(logits, alpha, beta, k_tf,
                                    tf.constant(params[None, :]))[0].numpy())
         value = float(self.value_net(o, training=False)[0, 0].numpy())
-        return (k, params), logp, value
+        return (k_out, params), logp, value
 
     def act(self, obs, epsilon=0.0):
-        """Deterministic greedy action (argmax strategy, Beta means) for eval.
+        """Deterministic greedy action (argmax per head, Beta means) for eval.
         epsilon is accepted for a uniform agent interface and ignored."""
         o = tf.constant(np.asarray(obs)[None, :], dtype=tf.float32)
         logits, alpha, beta = self._dist(o)
-        k = int(tf.argmax(logits[0]).numpy())
+        if self.multihead:
+            k = np.asarray([int(tf.argmax(lg[0]).numpy()) for lg in logits],
+                           dtype=np.int64)
+        else:
+            k = int(tf.argmax(logits[0]).numpy())
         params = (alpha / (alpha + beta))[0].numpy().astype(np.float32)
         return (k, params)
 

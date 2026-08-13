@@ -258,12 +258,119 @@ class ParamStrategyBoxNP(ParamStrategyContinuous):
         return (int(rng.integers(self.n)), rng.random(self.param_dim))
 
 
+class ParamStrategyFreedomPP(ParamStrategyBoxNP):
+    """freedom++ action space (EXP021/EXP022): the boxnp space with MULTI-HEAD
+    discrete control and two more knobs.
+
+    The discrete choices are NO LONGER folded into one joint index; each is its
+    own categorical head (the agent's policy has one Categorical per head, summed
+    log-probs), exposed via ``discrete_dims`` so the space scales additively
+    instead of multiplicatively:
+
+        strategy      (K)         which mutation strategy
+        box_center    (n_bc)      where to place the region
+        box_shape     (2)         axis-aligned box vs covariance ellipsoid
+        sampling_rule (3)         uniform | halton | opposition fill
+
+    Continuous parameters grow from 5 to 6 ([F, CR, budget_frac, box_scale, NP,
+    elite_carryover]); elite_carryover in [0, 0.3] is the fraction of NP carried
+    over verbatim (best-first) from the previous population into the next segment.
+
+    An action is ``(discrete_indices, raw_params)`` where discrete_indices is the
+    4-tuple ``(strategy_idx, box_center_idx, box_shape_idx, sampling_rule_idx)``
+    and raw_params is a length-6 array in [0,1]. The env consumes the decoded
+    dict, which now also carries box_shape, sampling_rule and elite_carryover.
+    """
+
+    name = "param_strategy_freedompp"
+    PARAM_NAMES = ("F", "CR", "budget_frac", "box_scale", "pop_size",
+                   "elite_carryover")
+    continuous_box = True
+    is_freedompp = True
+    BOX_SHAPES = ("axis", "covariance")
+    SAMPLING_RULES = ("uniform", "halton", "opposition")
+
+    def __init__(self, strategy_profiles, budget_fracs=None, *,
+                 f_range=(0.0, 1.0), cr_range=(0.0, 1.0),
+                 budget_range=(0.05, 0.95), box_scale_range=(0.25, 3.0),
+                 np_range=(16, 400), box_centers=None,
+                 elite_range=(0.0, 0.3), box_shapes=None,
+                 sampling_rules=None, **_ignored):
+        super().__init__(strategy_profiles, budget_fracs,
+                         f_range=f_range, cr_range=cr_range,
+                         budget_range=budget_range,
+                         box_scale_range=box_scale_range,
+                         np_range=np_range, box_centers=box_centers)
+        self.box_shapes = list(box_shapes) if box_shapes is not None \
+            else list(self.BOX_SHAPES)
+        self.sampling_rules = list(sampling_rules) if sampling_rules is not None \
+            else list(self.SAMPLING_RULES)
+        self.elite_range = (float(elite_range[0]), float(elite_range[1]))
+        self.param_dim = len(self.PARAM_NAMES)          # 6
+        # One categorical head per discrete factor (order matters: it is the
+        # order of the tuple the agent emits and decode() reads).
+        self.discrete_dims = [len(self.strategies), len(self.box_centers),
+                              len(self.box_shapes), len(self.sampling_rules)]
+        # For the multi-head agent, env.n_actions IS this list (not a scalar K);
+        # the agent builds one logits group per entry.
+        self.n = list(self.discrete_dims)
+
+    def decode(self, action):
+        """action = ((strategy_idx, box_center_idx, box_shape_idx,
+        sampling_rule_idx), raw_params[6]) -> env config dict."""
+        disc, raw = action
+        s_idx, bc_idx, shp_idx, rule_idx = (int(x) for x in disc)
+        for idx, dim, what in ((s_idx, self.discrete_dims[0], "strategy"),
+                               (bc_idx, self.discrete_dims[1], "box_center"),
+                               (shp_idx, self.discrete_dims[2], "box_shape"),
+                               (rule_idx, self.discrete_dims[3], "sampling_rule")):
+            if not 0 <= idx < dim:
+                raise IndexError(
+                    f"{what} index {idx} out of range [0,{dim}) for {self.name}.")
+        raw = np.asarray(raw, dtype=np.float64).reshape(-1)
+        if raw.shape[0] != self.param_dim:
+            raise ValueError(
+                f"{self.name} expects {self.param_dim} params, got {raw.shape[0]}.")
+        F, CR, budget_frac, box_scale = [
+            lo + min(max(float(v), 0.0), 1.0) * (hi - lo)
+            for v, (lo, hi) in zip(raw[:4], self.ranges)
+        ]
+        e_lo, e_hi = self.elite_range
+        elite = e_lo + min(max(float(raw[5]), 0.0), 1.0) * (e_hi - e_lo)
+        return {
+            "strategy": self.strategies[s_idx],
+            "box_center": self.box_centers[bc_idx],
+            "box_shape": self.box_shapes[shp_idx],
+            "sampling_rule": self.sampling_rules[rule_idx],
+            "F": F,
+            "CR": CR,
+            "budget_frac": budget_frac,
+            "box_scale": box_scale,
+            "sampling_box": box_scale,        # continuous region scale
+            "pop_size": self.np_from_raw(raw[4]),
+            "elite_carryover": elite,
+        }
+
+    def elite_norm(self, frac):
+        """elite fraction -> [0,1] over elite_range, for the observation's
+        prev_elite_carryover feature (inverse of the decode mapping)."""
+        e_lo, e_hi = self.elite_range
+        return float((min(max(frac, e_lo), e_hi) - e_lo) / (e_hi - e_lo + 1e-12))
+
+    def sample_random(self, rng):
+        """Uniform random action: one index per discrete head + 6 params in
+        [0,1], for the per-experiment random baseline."""
+        disc = tuple(int(rng.integers(d)) for d in self.discrete_dims)
+        return (disc, rng.random(self.param_dim))
+
+
 # --------------------------------------------------------------- registry
 
 ACTION_SPACES = {
     "profiles_budget_area": ProfilesBudgetArea,
     "param_strategy_continuous": ParamStrategyContinuous,
     "param_strategy_boxnp": ParamStrategyBoxNP,
+    "param_strategy_freedompp": ParamStrategyFreedomPP,
 }
 
 
