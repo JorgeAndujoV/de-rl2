@@ -165,6 +165,8 @@ def _stacked(ax, x, frac_by_cat, categories, cmap, width=0.8):
 # --------------------------------------------------------------- axis labels
 _AXIS_TITLE = {"strategy": "DE strategy",
                "box_center": "sampling-box centre",
+               "box_shape": "sampling-box shape",
+               "sampling_rule": "sampling rule",
                "budget_frac_action": "budget fraction / segment",
                "sampling_box_action": "sampling box"}
 
@@ -371,11 +373,13 @@ def _action_space(func_dir):
 
 def _is_continuous_actions(func_dir):
     """True if this experiment used a continuous parameterized action space
-    (param_strategy_continuous or param_strategy_boxnp). Falls back to sniffing a
-    step trace (a non-integer sampling_box means a continuous box scale)."""
+    (param_strategy_continuous, param_strategy_boxnp or param_strategy_freedompp).
+    Falls back to sniffing a step trace (a non-integer sampling_box means a
+    continuous box scale)."""
     sp = _action_space(func_dir)
     if sp is not None:
-        return sp in ("param_strategy_continuous", "param_strategy_boxnp")
+        return sp in ("param_strategy_continuous", "param_strategy_boxnp",
+                      "param_strategy_freedompp")
     ks = discover_checkpoints(func_dir)
     if ks:
         p = os.path.join(_chkp_dir(func_dir, ks[-1]), "step_trace.csv")
@@ -387,16 +391,28 @@ def _is_continuous_actions(func_dir):
 
 def _cont_param_series(func_dir, checkpoints):
     """Per-checkpoint median/IQR of each continuous parameter, and the mix of each
-    DISCRETE choice, pooled over all seeds/steps of a checkpoint's step_trace. The
-    boxnp action space adds the NP parameter and the box_center choice.
+    DISCRETE choice, pooled over all seeds/steps of a checkpoint's step_trace.
+
+    The action spaces add knobs progressively:
+      * param_strategy_boxnp   -> + NP (param) and box_center (discrete choice);
+      * param_strategy_freedompp -> the boxnp set plus elite_carryover (param) and
+        box_shape + sampling_rule (discrete choices).
 
     Returns (ks, params, stats, disc, mix, all_disc): params is the [(col,title)]
-    list actually present; disc is the discrete axes ('strategy' [, 'box_center'])."""
-    boxnp = _action_space(func_dir) == "param_strategy_boxnp"
+    list actually present; disc is the list of discrete axes."""
+    sp = _action_space(func_dir)
+    boxnp = sp == "param_strategy_boxnp"
+    freedompp = sp == "param_strategy_freedompp"
     params = list(_CONT_PARAMS)
-    if boxnp:
+    if boxnp or freedompp:
         params = params + [("pop_size_action", "population size NP")]
-    disc = ["strategy"] + (["box_center"] if boxnp else [])
+    if freedompp:
+        params = params + [("elite_carryover", "elite carryover fraction")]
+    disc = ["strategy"]
+    if boxnp:
+        disc += ["box_center"]
+    if freedompp:
+        disc += ["box_center", "box_shape", "sampling_rule"]
     cols = [c for c, _ in params]
     ks = []
     stats = {c: {"med": [], "q1": [], "q3": []} for c in cols}
