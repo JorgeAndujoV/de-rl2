@@ -1,0 +1,147 @@
+{
+  "experiment": "EXP019_hybridppo_freedom_cov_15k",
+  "mode": "train_eval",
+  "git_commit": "c784b701b7cab9b67dc525398c2e499acb8dbd4c",
+  "git_dirty": true,
+  "slurm_job_id": "19667785",
+  "hostname": "c36.nibi.sharcnet",
+  "started_at": "2026-08-12T13:38:26Z",
+  "finished_at": "2026-08-12T14:38:47Z",
+  "wall_seconds": 3621,
+  "exit_status": "failed",
+  "python_version": "3.11.5",
+  "tensorflow_version": "2.19.1",
+  "numpy_version": "2.1.1",
+  "resolved_config": {
+    "experiment": "EXP019_hybridppo_freedom_cov_15k",
+    "seed": 0,
+    "benchmark": {
+      "name": "cec13",
+      "functions": [
+        3
+      ],
+      "dim": 30,
+      "budget": 300000
+    },
+    "episode": {
+      "pop_size": 50,
+      "warmup_frac": 0.05,
+      "warmup": {
+        "strategy": "rand/1/bin",
+        "F": 0.5,
+        "CR": 0.9
+      },
+      "box_center": "centroid",
+      "box_scales": [
+        1.0
+      ],
+      "box_min_frac": 0.0417,
+      "elitism": false,
+      "truncate_last_segment": true
+    },
+    "environment": {
+      "observation": "traj20_contboxnp",
+      "n_checkpoints": 20,
+      "action_space": "param_strategy_boxnp",
+      "sampling_box": "covariance",
+      "f_range": [
+        0.0,
+        1.0
+      ],
+      "cr_range": [
+        0.0,
+        1.0
+      ],
+      "budget_range": [
+        0.05,
+        0.95
+      ],
+      "box_scale_range": [
+        0.25,
+        3.0
+      ],
+      "np_range": [
+        16,
+        400
+      ],
+      "box_centers": [
+        "centroid",
+        "incumbent",
+        "random"
+      ],
+      "strategy_profiles": [
+        {
+          "strategy": "rand/1/bin"
+        },
+        {
+          "strategy": "best/1/bin"
+        },
+        {
+          "strategy": "current-to-best/1/bin"
+        },
+        {
+          "strategy": "rand/2/bin"
+        },
+        {
+          "strategy": "current-to-pbest/1/bin"
+        }
+      ],
+      "reward": {
+        "name": "log_stagnation",
+        "lambda": 0.1,
+        "tau_stag": 3
+      }
+    },
+    "agent": {
+      "name": "hybrid_ppo",
+      "param_dim": 5,
+      "discounting": "per_budget",
+      "gamma": 0.99,
+      "gae_lambda": 0.95,
+      "lr": 0.0003,
+      "policy_hidden": [
+        128,
+        128
+      ],
+      "value_hidden": [
+        128,
+        128
+      ],
+      "clip": 0.2,
+      "epochs": 10,
+      "minibatch_size": 64,
+      "entropy_coef": 0.01,
+      "value_coef": 0.5,
+      "max_grad_norm": 0.5,
+      "rollout_steps": 512,
+      "n_envs": 8
+    },
+    "training": {
+      "episodes": 15000,
+      "eval_every": 2000,
+      "eval_episodes": 10,
+      "checkpoint_every": 2000,
+      "periodic_eval": {
+        "start": 1000,
+        "every": 1000
+      }
+    },
+    "evaluation": {
+      "runs_per_function": 51,
+      "seed_offset": 900000,
+      "save_trajectory_seeds": 3,
+      "baseline_namespace": "BASE_BOXNP_COV",
+      "compare_against": [
+        "BASE001_de_plain",
+        "BASE003_random"
+      ]
+    },
+    "slurm": {
+      "time": "5-00:00:00",
+      "mem": "16G",
+      "cpus": 8,
+      "gpus": 0,
+      "account": "def-bolufe"
+    }
+  }
+}
