@@ -724,8 +724,30 @@ def _build(name, dim):
             z = z_np(np.atleast_2d(np.asarray(x, np.float64)))
             return float(g_np(z)[0] + bias)
 
-        def eval_tf(x):
-            return g_tf(z_tf(x)) + bias
+        if n == 3:
+            # f3 (Bent Cigar) is the one standalone function that overflows the
+            # float32 TF path. The asy^0.5 transform's sqrt(|z|) exponent lifts
+            # |z|~1e2 (early, far-from-optimum DE points) to ~1e18, and
+            # bent_cigar's 1e6 * sum(z^2) then reaches ~1e42 -- past float32's
+            # max 3.4e38 -> inf -> NaN in the observation/policy downstream.
+            # Evaluate it in float64 (the SAME recipe as eval_np below, the
+            # reference path) so no overflow can occur. Every other function
+            # keeps the float32 path unchanged. The z-chain mirrors _z_builders'
+            # n == 3 branch (M2 . asy^0.5(M1 . (x - o))), promoted to float64.
+            o64 = tf.constant(shift_for(n, dim), tf.float64)
+            M1_64 = tf.constant(rotation_for(dim, 0), tf.float64)
+            M2_64 = tf.constant(rotation_for(dim, 1), tf.float64)
+
+            def eval_tf(x):
+                xd = tf.cast(x, tf.float64)
+                z = tf.matmul(
+                    _t_asy_tf(tf.matmul(xd - o64, M1_64, transpose_b=True),
+                              0.5, fallback=xd - o64),
+                    M2_64, transpose_b=True)
+                return g_tf(z) + bias      # g_tf is dtype-generic -> float64
+        else:
+            def eval_tf(x):
+                return g_tf(z_tf(x)) + bias
 
     return BenchmarkSpec(
         id=f"cec13:{name}", suite="cec13", name=_NAMES[n], dim=dim,

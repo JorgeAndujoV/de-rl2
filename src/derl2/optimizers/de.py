@@ -94,8 +94,12 @@ class _SegmentDE:
         self.population = tf.Variable(
             tf.zeros((pop_size, dim), dtype=tf.float32), trainable=False
         )
+        # float64 so extreme-conditioning functions (f3: bent_cigar reaches
+        # ~1e42, past float32's 3.4e38) store finite fitness instead of inf.
+        # For every other function the objective still returns float32; the
+        # upcast on assign is lossless, so selection stays byte-identical.
         self.fitness = tf.Variable(
-            tf.zeros((pop_size,), dtype=tf.float32), trainable=False
+            tf.zeros((pop_size,), dtype=tf.float64), trainable=False
         )
         self.reset(seed)
 
@@ -140,7 +144,7 @@ class _SegmentDE:
             init = center[None, :] + tf.matmul(z, chol, transpose_b=True)
             init = tf.clip_by_value(init, self.lower, self.upper)
         self.population.assign(init)
-        self.fitness.assign(self.objective(init))
+        self.fitness.assign(tf.cast(self.objective(init), tf.float64))
         self.evals = self.pop_size
         self.best_fitness = float(tf.reduce_min(self.fitness).numpy())
         best = int(tf.argmin(self.fitness).numpy())
@@ -190,7 +194,7 @@ class _SegmentDE:
         cross = tf.logical_or(cross, tf.cast(tf.one_hot(j_rand, D), tf.bool))
         trial = tf.where(cross, mutant, x)
 
-        trial_fitness = self.objective(trial)
+        trial_fitness = tf.cast(self.objective(trial), tf.float64)
         improved = trial_fitness <= self.fitness
         self.population.assign(tf.where(improved[:, None], trial, x))
         self.fitness.assign(tf.where(improved, trial_fitness, self.fitness))
@@ -303,7 +307,10 @@ def run_segment(objective, dim, pop_size, box_lo, box_hi, domain_lo, domain_hi,
 
     # Checkpoints at evenly spaced generation fractions (spec §5), so the
     # trajectory has fixed length K regardless of fe_budget.
-    trajectory = np.zeros((K, 5), dtype=np.float32)
+    # float64: channels 2 (best) and 3 (mean) hold raw fitness, which for f3
+    # reaches ~1e42 -- float32 here would re-truncate to inf and NaN the obs.
+    # The observation compresses these via log10 before its own float32 cast.
+    trajectory = np.zeros((K, 5), dtype=np.float64)
     prev = 0
     for i in range(K):
         c = round((i + 1) * generations / K)
