@@ -28,8 +28,13 @@
 set -euo pipefail
 
 # ------------------------------------------------------------ cluster setup
-PYTHON_MODULE="python/3.11"
-VENV="$HOME/de-rl2-env"
+# EXP026 uses a DEDICATED venv (jax/jaxlib/evosax added on top of derl2+TF) so
+# adding those packages can never bump a shared dep in de-rl2-env and perturb an
+# EXP016/020-025 evaluation re-run. Override with DERL2_ES_VENV if you really
+# want to reuse de-rl2-env. PYTHON_MODULE must match the python this venv was
+# built with (and the wheelhouse cp tag of the jax/evosax wheels).
+PYTHON_MODULE="${DERL2_ES_PYTHON_MODULE:-python/3.11}"
+VENV="${DERL2_ES_VENV:-$HOME/de-rl2-es-env}"
 REPO="$HOME/de-rl2"
 
 # ---------------------------------------------------------------- arguments
