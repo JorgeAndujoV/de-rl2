@@ -141,6 +141,23 @@ def main():
     policy_hidden = cfg.get("agent.policy_hidden")
     seed = int(cfg.get("seed"))
 
+    # SMOKE_OVERRIDES (config.py) scales training.*/benchmark.* but NOT es.*, so a
+    # bare --smoke would otherwise run the full es.num_generations. Shrink es.* to
+    # a crash-check size here -- but only for keys the user did NOT pass via --set,
+    # so an explicit `--set es.num_generations=5` still wins.
+    if cfg.is_smoke:
+        set_keys = {s.split("=", 1)[0].strip() for s in args.set}
+        if "es.population_size" not in set_keys:
+            pop = 4
+        if "es.num_generations" not in set_keys:
+            gens = 2
+        if "es.eval_runs" not in set_keys:
+            eval_runs = 2
+
+    # Workers beyond the population can never help (a generation has only `pop`
+    # episodes); cap so a big --workers/cpus never spawns idle workers.
+    workers = min(workers, pop)
+
     # obs_dim / n_actions come from the env; a template net gives the flat dim.
     env = DEEnv.from_config(cfg)
     obs_dim, n_actions = env.obs_dim, env.n_actions

@@ -57,6 +57,13 @@ agent:
   param_dim: 5                 # F, CR, budget_frac, box_scale, NP
   policy_hidden: [128, 128]
 
+# Shared Config.validate() (REQUIRED_KEYS) demands training.episodes for every
+# config. Sep-CMA-ES does NOT use it -- train_es.py reads es.* below -- so this is
+# only a schema shim, set to population_size * num_generations (the total episodes
+# the ES run evaluates) for honesty. Kept additive: no edit to the shared validator.
+training:
+  episodes: 19200
+
 es:
   population_size: 64          # perturbed weight vectors per generation (even -> antithetic)
   num_generations: 300         # explicit, independent of population_size
