@@ -55,6 +55,7 @@ RESUME=0
 FUNCTION=""
 CPUS_OVERRIDE=""
 TIME_OVERRIDE=""
+MEM_OVERRIDE=""
 PASS_ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -66,6 +67,8 @@ while [ $# -gt 0 ]; do
         --cpus=*)     CPUS_OVERRIDE="${1#*=}" ;;
         --time)       TIME_OVERRIDE="$2"; shift ;;
         --time=*)     TIME_OVERRIDE="${1#*=}" ;;
+        --mem)        MEM_OVERRIDE="$2"; shift ;;
+        --mem=*)      MEM_OVERRIDE="${1#*=}" ;;
         *)            PASS_ARGS+=("$1") ;;
     esac
     shift
@@ -91,7 +94,7 @@ cd "$REPO"
 
 ACCOUNT=$(python -m derl2.config --config "$CONFIG" slurm.account)
 CPUS=${CPUS_OVERRIDE:-$(python -m derl2.config --config "$CONFIG" slurm.cpus)}
-MEM=$(python -m derl2.config --config "$CONFIG" slurm.mem)
+MEM=${MEM_OVERRIDE:-$(python -m derl2.config --config "$CONFIG" slurm.mem)}
 GPUS=$(python -m derl2.config --config "$CONFIG" slurm.gpus)
 TIME=${TIME_OVERRIDE:-$(python -m derl2.config --config "$CONFIG" slurm.time)}
 # Validation is short by construction; unless overridden, cap it to 2h.

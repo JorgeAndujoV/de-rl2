@@ -87,7 +87,8 @@ evaluation:
 
 slurm:
   time: "1-00:00:00"
-  mem: "16G"
+  mem: "128G"                  # ~0.5-1G per spawn worker (each loads its OWN TF) x 64
+                               # workers + main (TF+JAX+evosax); 16G OOMs at 64 workers
   cpus: 64                     # population-parallel; raised from 8 -> cores
   gpus: 0
   account: def-bolufe
