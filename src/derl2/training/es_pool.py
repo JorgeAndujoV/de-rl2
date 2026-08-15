@@ -110,6 +110,35 @@ class ESWorkerPool:
             idx += len(batch)
         return np.asarray(results, dtype=np.float64)
 
+    def evaluate_multiseed(self, flat_pop, seeds, function_id):
+        """flat_pop: (P, D); seeds: K seed values. Returns final_error (P, K).
+
+        Each member is evaluated on the SAME K seeds (common random numbers
+        across members within a generation -> members are ranked on the same K
+        problem instances). The P*K episodes are flattened member-major and
+        dispatched in synchronous batches of n_workers, so a batch may straddle
+        two members -- worker count stays independent of P and K. The caller
+        reduces over the K axis (mean log-quality) into a per-member fitness.
+
+        This is the noise-reduced fitness path (es.fitness_seeds > 1); with K=1
+        it returns the same single-seed errors as evaluate() as a (P, 1) column.
+        """
+        P = len(flat_pop)
+        seeds = [int(s) for s in seeds]
+        K = len(seeds)
+        tasks = [(m, s) for m in range(P) for s in seeds]   # member-major
+        out = [None] * len(tasks)
+        idx = 0
+        while idx < len(tasks):
+            batch = list(range(idx, min(idx + self.n_workers, len(tasks))))
+            for w, t in enumerate(batch):
+                m, s = tasks[t]
+                self.conns[w].send(("eval", (flat_pop[m], s, int(function_id))))
+            for w, t in enumerate(batch):
+                out[t] = self._recv(self.conns[w])
+            idx += len(batch)
+        return np.asarray(out, dtype=np.float64).reshape(P, K)
+
     def evaluate_seeds(self, flat, seeds, function_id):
         """Evaluate ONE weight vector `flat` across a LIST of `seeds`, in parallel
         batches. Returns final_error (len(seeds),) aligned to `seeds`.

@@ -131,6 +131,7 @@ def main():
     gens = int(cfg.get("es.num_generations"))
     workers = int(args.workers if args.workers is not None
                   else cfg.get("es.workers"))
+    fitness_seeds = int(cfg.get("es.fitness_seeds", 1))
     elite_ratio = float(cfg.get("es.elite_ratio", 0.3))
     sigma_init = float(cfg.get("es.sigma_init", 0.05))
     antithetic = bool(cfg.get("es.antithetic", True))
@@ -153,6 +154,9 @@ def main():
             gens = 2
         if "es.eval_runs" not in set_keys:
             eval_runs = 2
+        if "es.fitness_seeds" not in set_keys:
+            fitness_seeds = 2          # keep >1 so the multi-seed path is smoked
+    fitness_seeds = max(1, fitness_seeds)
 
     # Workers beyond the population can never help (a generation has only `pop`
     # episodes); cap so a big --workers/cpus never spawns idle workers.
@@ -168,7 +172,8 @@ def main():
     print(f"{cfg.exp_id} | Sep-CMA-ES f{fid} dim={cfg.get('benchmark.dim')} "
           f"budget={cfg.get('benchmark.budget')} | obs_dim={obs_dim} "
           f"n_actions={n_actions} num_dims={num_dims}", flush=True)
-    print(f"pop={pop} gens={gens} workers={workers} elite_ratio={elite_ratio} "
+    print(f"pop={pop} gens={gens} fitness_seeds={fitness_seeds} "
+          f"workers={workers} elite_ratio={elite_ratio} "
           f"sigma_init={sigma_init} antithetic={antithetic} "
           f"ckpt_every={checkpoint_every} eval_every={eval_every} "
           f"eval_runs={eval_runs}"
@@ -220,16 +225,24 @@ def main():
                 raise SystemExit(42)
             t0 = time.perf_counter()
             x = es.ask()                                   # (pop, num_dims)
-            ep_seed = _ES_SEED_BASE + gen                  # CRN within a gen
-            errors = pool.evaluate(x, ep_seed, fid)        # (pop,)
-            quality = -np.log10(errors + ERR_EPS)          # higher = better
+            # K distinct seeds this generation, shared by all members (CRN); the
+            # band advances by K each generation so no instance repeats. With
+            # fitness_seeds=1 this is the old single-seed path (a (pop, 1) column).
+            gen_seeds = [_ES_SEED_BASE + gen * fitness_seeds + i
+                         for i in range(fitness_seeds)]
+            err = pool.evaluate_multiseed(x, gen_seeds, fid)   # (pop, K)
+            # Fitness = MEAN log-quality across the K seeds: rewards members that
+            # reach low error CONSISTENTLY across instances (a bad seed drags the
+            # mean down), which is exactly what the multi-seed final eval rewards.
+            quality = np.mean(-np.log10(err + ERR_EPS), axis=1)   # (pop,)
             es.tell(x, quality)
 
             dt = time.perf_counter() - t0
-            g_best = float(np.min(errors))
-            g_mean = float(np.mean(errors))
+            member_err = err.mean(axis=1)                  # per-member mean error
+            g_best = float(np.min(member_err))
+            g_mean = float(np.mean(member_err))
             best_error = min(best_error, g_best)
-            eps = pop / dt if dt > 0 else float("nan")
+            eps = (pop * fitness_seeds) / dt if dt > 0 else float("nan")
             writer.writerow([gen, f"{dt:.3f}", f"{eps:.2f}",
                              f"{g_best:.6e}", f"{g_mean:.6e}",
                              f"{best_error:.6e}"])

@@ -11,11 +11,12 @@ comparison, trajectories) and the identical paired baseline comparison every
 PPO experiment gets, with zero change to evaluate.py or the registry.
 
     python -m derl2.evaluation.evaluate_es --train-dir experiments/EXP026_.../train/f11
-    python -m derl2.evaluation.evaluate_es --train-dir ... --weights best_mean
+    python -m derl2.evaluation.evaluate_es --train-dir ... --weights mean
 
-`mean.npy` (the final Sep-CMA-ES distribution mean) is the standard deployable
-CMA-ES solution and the default; `best_mean.npy` (the mean whose validation
-median was best during training) is available for an early-stopping-style choice.
+By default (`--weights auto`) this evaluates `best_mean.npy` (the mean whose
+validation median was best during training -- an early-stopping-style choice)
+when a validation monitor ran, else falls back to `mean.npy` (the final
+Sep-CMA-ES distribution mean). Pass `--weights mean` to force the final mean.
 Reads the config the training job actually ran from run_metadata.json, exactly
 as evaluate.py does, so a smoke run evaluates the smoke-scaled config.
 """
@@ -32,8 +33,16 @@ from derl2.agents.sep_cmaes import build_policy_net, set_flat
 
 
 def _resolve_weights(train_dir, weights):
-    if weights in ("mean", "best_mean"):
-        path = os.path.join(train_dir, "checkpoints", f"{weights}.npy")
+    ckpt = os.path.join(train_dir, "checkpoints")
+    if weights == "auto":
+        # Prefer the early-stopping pick (best validation median); fall back to
+        # the final distribution mean if no monitor ran (e.g. eval_every=0). On
+        # the oscillating hard functions the final mean can overshoot its best
+        # validation point, so best_mean is the better default deployable.
+        best = os.path.join(ckpt, "best_mean.npy")
+        path = best if os.path.exists(best) else os.path.join(ckpt, "mean.npy")
+    elif weights in ("mean", "best_mean"):
+        path = os.path.join(ckpt, f"{weights}.npy")
     else:
         path = weights                       # explicit path
     if not os.path.exists(path):
@@ -54,9 +63,10 @@ def main():
                              "train dir itself (matches evaluate.py).")
     parser.add_argument("--function", type=int, default=None,
                         help="Restrict evaluation to one function id.")
-    parser.add_argument("--weights", default="mean",
-                        help="mean (default), best_mean, or a path to a .npy "
-                             "flat weight vector.")
+    parser.add_argument("--weights", default="auto",
+                        help="auto (default: best_mean if a validation monitor "
+                             "ran, else mean), mean, best_mean, or a path to a "
+                             ".npy flat weight vector.")
     args = parser.parse_args()
 
     # Config the training job actually ran (smoke-scaled if it was a smoke job).

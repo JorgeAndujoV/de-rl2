@@ -1,0 +1,114 @@
+experiment: EXP027_sepcmaes_freedompp
+seed: 0
+
+# EXP027: EXP021's "freedom++" setup (param_strategy_freedompp action space,
+# traj20_freedompp observation, 4 FACTORED discrete heads + 6 continuous params,
+# same [128,128] MLP and deterministic decode) trained with SEPARABLE CMA-ES
+# (evosax) instead of PPO -- the freedom++ sibling of EXP026. No critic; ES
+# searches the policy net's weights only. Fitness = -log10(final_best_error +
+# 1e-8) at the full FE budget (ES optimises the eval metric directly, its own
+# best configuration, NOT a controlled PPO-objective match). Evaluated the
+# repo-standard way against BASE001_de_plain (plainDE) and BASE003_random
+# (random). One function per job. Strictly additive: reuses the EXP026 ES stack
+# (train_es / es_pool / evaluate_es); no edits to the PPO agent, train.py, env,
+# observation or action-space code.
+#
+# The [128,128] MLP is provably expressive enough for this space: EXP021's PPO
+# reached the optimum on it in the same net (f10/f11 median 0, f6 median 0, f2
+# median ~4.2e3). So capacity is not the bottleneck -- the ES SEARCH is. EXP026
+# showed the ES plateaus into generation-to-generation noise oscillation on the
+# hard functions with single-seed fitness at 300 generations. EXP027 therefore
+# TUNES the search rather than the architecture:
+#   - fitness_seeds > 1: each member scored on K seeds (mean log-quality), which
+#     cuts the fitness-ranking noise that caused the plateau and rewards policies
+#     that generalise across instances -- exactly what the 51-seed eval measures;
+#   - more generations: Sep-CMA-ES's evolution-path statistics need many
+#     sequential updates to adapt; 300 was short;
+#   - larger population: a healthier CMA sample and more elites per mean update.
+
+benchmark:
+  name: cec13
+  functions: [2, 6, 11, 12, 17, 3, 7, 15, 10, 16, 22]
+  dim: 30
+  budget: 300000
+
+episode:
+  pop_size: 50                 # warm-up NP (fixed); agent sets NP per segment
+  warmup_frac: 0.05
+  warmup: {strategy: rand/1/bin, F: 0.5, CR: 0.9}
+  box_center: centroid         # fallback; the agent chooses per segment
+  box_scales: [1.0]
+  box_min_frac: 0.0417
+  elitism: false               # env-level incumbent injection; unrelated to the
+                               # agent's elite_carryover action
+  truncate_last_segment: true
+
+environment:
+  observation: traj20_freedompp
+  n_checkpoints: 20
+  action_space: param_strategy_freedompp
+  f_range: [0.0, 1.0]
+  cr_range: [0.0, 1.0]
+  budget_range: [0.05, 0.95]
+  box_scale_range: [0.25, 3.0]
+  np_range: [16, 400]
+  box_centers: [centroid, incumbent, random]
+  elite_range: [0.0, 0.3]
+  box_shapes: [axis, covariance]
+  sampling_rules: [uniform, halton, opposition]
+  strategy_profiles:
+    - {strategy: rand/1/bin}
+    - {strategy: best/1/bin}
+    - {strategy: current-to-best/1/bin}
+    - {strategy: rand/2/bin}
+    - {strategy: current-to-pbest/1/bin}
+  # The env still computes a reward per step; Sep-CMA-ES ignores it (fitness is
+  # final error). Kept identical to EXP021 so the environment is byte-identical.
+  reward: {name: log_stagnation, lambda: 0.1, tau_stag: 3}
+
+# `agent` documents the policy net Sep-CMA-ES optimises; it is NOT built through
+# the agent registry (train_es.py reads param_dim + policy_hidden and reuses the
+# Hybrid-PPO multi-head net directly). Same [128,128] shape as EXP021 -- output
+# width is 25 (13 factored discrete logits + 2*6 Beta params), so num_dims is
+# ~33.8k, only ~4% above EXP026's boxnp net.
+agent:
+  name: sep_cmaes
+  param_dim: 6                 # F, CR, budget_frac, box_scale, NP, elite_carryover
+  policy_hidden: [128, 128]
+
+# Shared Config.validate() (REQUIRED_KEYS) demands training.episodes. Sep-CMA-ES
+# does NOT use it -- train_es.py reads es.* below -- so this is only a schema
+# shim, set to population_size * num_generations * fitness_seeds (the total
+# episodes the ES run evaluates) for honesty. Additive: no edit to the validator.
+training:
+  episodes: 384000             # 128 * 1000 * 3
+
+es:
+  population_size: 128         # perturbed weight vectors per generation (even -> antithetic)
+  num_generations: 1000        # ~3.3x EXP026: Sep-CMA-ES evolution path needs sequential updates
+  fitness_seeds: 3             # episodes per member per gen; fitness = mean log-quality (noise fix)
+  workers: 8                   # LOCAL default; Slurm sets this to the core count
+  elite_ratio: 0.3             # evosax reference sweep: {0.2, 0.3, 0.4, 0.5}
+  sigma_init: 0.05             # initial per-parameter step size
+  antithetic: true             # mirrored perturbations around the mean (needs even population)
+  checkpoint_every: 10         # generations between resume checkpoints (es_state.pkl + mean.npy)
+  eval_every: 40               # generations between mean-policy validation monitors (eval_log.csv)
+  eval_runs: 24                # validation episodes per monitor (8e5 band); selects best_mean.npy
+
+evaluation:
+  runs_per_function: 51
+  seed_offset: 900000
+  save_trajectory_seeds: 3
+  # Own baseline set (freedom++): the random baseline samples the full multi-head
+  # + elite/rule/shape space, so it differs from every earlier space. Shared with
+  # EXP021/EXP022 (already generated), so run_baseline --skip-existing reuses it.
+  baseline_namespace: BASE_FREEDOMPP
+  compare_against: [BASE001_de_plain, BASE003_random]
+
+slurm:
+  time: "2-00:00:00"           # ~384k eps/fn; ~27h on the slow functions @ ~4 ep/s,
+                               # ~12h on the fast ones @ ~9 ep/s (--max-hours resumes)
+  mem: "128G"                  # ~0.5-1G per spawn worker (own TF) x 64 workers + main (TF+JAX)
+  cpus: 64                     # population-parallel; workers capped at min(cpus, pop)
+  gpus: 0
+  account: def-bolufe
